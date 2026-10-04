@@ -17,6 +17,7 @@
 #include <vector>
 
 #include <unistd.h>
+#include <cstdio>
 
 namespace
 {
@@ -242,6 +243,40 @@ try
         }
     }
 
+    // Recording to a file and playing it back (Viewer "Record" button / "Add Source > Load Recorded Sequence")
+    {
+        char dir_template[] = "/tmp/rs-selftest-XXXXXX";
+        std::string dir = mkdtemp( dir_template ) ? dir_template : "/tmp";
+        std::string file = dir + "/selftest.db3";
+        {
+            rs2::pipeline pipe( ctx );
+            rs2::config cfg;
+            cfg.enable_device( info( dev, RS2_CAMERA_INFO_SERIAL_NUMBER ) );
+            cfg.enable_stream( RS2_STREAM_DEPTH, 640, 480, RS2_FORMAT_Z16, 30 );
+            cfg.enable_stream( RS2_STREAM_COLOR, 640, 480, RS2_FORMAT_RGB8, 30 );
+            cfg.enable_record_to_file( file );
+            pipe.start( cfg );
+            for( int i = 0; i < 60; ++i )
+                pipe.wait_for_frames();
+            pipe.stop();
+        }
+        int played = 0;
+        {
+            rs2::pipeline pipe( ctx );
+            rs2::config cfg;
+            cfg.enable_device_from_file( file, false );
+            auto profile = pipe.start( cfg );
+            profile.get_device().as< rs2::playback >().set_real_time( false );
+            rs2::frameset fs;
+            while( pipe.try_wait_for_frames( &fs, 2000 ) )
+                played++;
+            pipe.stop();
+        }
+        report( played > 30, "record to " + file + " and play back (" + std::to_string( played ) + " framesets)" );
+        std::remove( file.c_str() );
+        rmdir( dir.c_str() );
+    }
+
     // Repeated power cycles of individual sensors - must not disturb the other running sensor
     if( depth_sensor && color_sensor )
     {
@@ -254,9 +289,9 @@ try
         std::string details;
         for( int i = 0; i < 3; ++i )
         {
-            int n = stream_sensor( color_sensor, { cp }, 1.0 )["Color"];
+            int n = stream_sensor( color_sensor, { cp }, 2.0 )["Color"];
             details += " color=" + std::to_string( n );
-            ok = ok && n > 10;
+            ok = ok && n > 30;
         }
         if( motion_sensor )
         {

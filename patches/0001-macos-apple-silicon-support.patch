@@ -527,20 +527,21 @@ index e73bbc762..fae02db0b 100644
          rs_usb_interface rs_hid_device::get_hid_interface()
          {
 diff --git a/src/hid/hid-device.h b/src/hid/hid-device.h
-index 8a148ca3e..c5a8324c0 100644
+index 8a148ca3e..411a00b30 100644
 --- a/src/hid/hid-device.h
 +++ b/src/hid/hid-device.h
-@@ -17,9 +17,6 @@
+@@ -17,10 +17,6 @@
  #include <thread>
  #include "../types.h"
  
 -#ifdef __APPLE__
 -#include <hidapi.h>
 -#endif
- 
+-
  namespace librealsense
  {
-@@ -51,22 +48,15 @@ namespace librealsense
+     namespace platform
+@@ -51,22 +47,15 @@ namespace librealsense
              rs_usb_interface get_hid_interface();
              //for gyro sensitivity the default value we set in feature report is 0.1, which is mapped in FW to 30.5 millideg/sec
              usb_status set_feature_report( unsigned char power, int report_id, int fps = 0, double sensitivity = 0.1 );
