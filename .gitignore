@@ -1,4 +1,12 @@
 /build/
 /dist/
 .DS_Store
-/.claude/settings.local.json
+# local tool settings and anything credential-like must never be committed
+/.claude/
+.env
+.env.*
+.netrc
+*.pem
+*.p12
+*.key
+*.mobileprovision

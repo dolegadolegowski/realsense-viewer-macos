@@ -132,6 +132,7 @@ STAGE="$WORK/dmg"
 mkdir -p "$STAGE"
 cp -R "$DIST/RealSense Viewer.app" "$DIST/RealSense Depth Quality Tool.app" "$TOOLS_DIR" "$STAGE/"
 ln -s /Applications "$STAGE/Applications"
+xattr -cr "$STAGE" 2>/dev/null || true   # no machine-specific extended attributes in the image
 DMG="$DIST/RealSense-Viewer-$VERSION-macOS-arm64.dmg"
 hdiutil create -volname "RealSense Viewer $VERSION" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
 echo "created $DMG"

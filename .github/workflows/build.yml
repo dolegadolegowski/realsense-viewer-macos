@@ -36,4 +36,5 @@ jobs:
         if: inputs.release_tag != ''
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${{ inputs.release_tag }}" dist/*.dmg --clobber
+          RELEASE_TAG: ${{ inputs.release_tag }}   # passed via env, never interpolated into the script
+        run: gh release upload "$RELEASE_TAG" dist/*.dmg --clobber
