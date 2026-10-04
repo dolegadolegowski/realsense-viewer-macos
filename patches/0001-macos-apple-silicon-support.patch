@@ -642,7 +642,7 @@ index 132215280..cd67f0170 100644
              {
                  auto rs_sts = claim_interface(interface);
 diff --git a/src/libusb/messenger-libusb.cpp b/src/libusb/messenger-libusb.cpp
-index 6f56eef0c..d6493cea4 100644
+index 6f56eef0c..da9ec1e79 100644
 --- a/src/libusb/messenger-libusb.cpp
 +++ b/src/libusb/messenger-libusb.cpp
 @@ -39,7 +39,7 @@ namespace librealsense
@@ -650,7 +650,7 @@ index 6f56eef0c..d6493cea4 100644
              {
                  std::string strerr = strerror(errno);
 -                LOG_WARNING("control_transfer returned error, index: " << index << ", error: " << strerr << ", number: " << int(errno));
-+                LOG_WARNING("control_transfer returned error, index: " << index << ", error: " << libusb_error_name(sts) << " (errno: " << strerr << ", number: " << int(errno) << ")");
++                LOG_WARNING("control_transfer returned error, index: " << index << ", value: " << value << ", error: " << libusb_error_name(sts) << " (errno: " << strerr << ", number: " << int(errno) << ")");
                  return libusb_status_to_rs(sts);
              }
              transferred = uint32_t(sts);
@@ -756,6 +756,45 @@ index bbe96c420..f8b99cb16 100644
      for (GLint i = 0; i < num_extensions; i++)
      {
          const char* extension = (const char*)glGetStringi(GL_EXTENSIONS, i);
+diff --git a/third-party/rsutils/include/rsutils/deferred.h b/third-party/rsutils/include/rsutils/deferred.h
+index 959f6870c..26e75431c 100644
+--- a/third-party/rsutils/include/rsutils/deferred.h
++++ b/third-party/rsutils/include/rsutils/deferred.h
+@@ -31,9 +31,18 @@ public:
+     {
+     }
+ 
+-    deferred( deferred && that ) = default;
++    // A moved-from std::function is left in an unspecified state (libc++ keeps small targets), so the source must be
++    // emptied explicitly or both objects would execute the deferred call
++    deferred( deferred && that )
++        : _deferred( that.detach() )
++    {
++    }
+ 
+-    deferred & operator=( deferred && ) = default;
++    deferred & operator=( deferred && that )
++    {
++        _deferred = that.detach();
++        return *this;
++    }
+ 
+     bool is_valid() const { return ! ! _deferred; }
+     operator bool() const { return is_valid(); }
+@@ -49,7 +58,12 @@ public:
+     void reset() { _deferred = {}; }
+ 
+     // Returns the deferred function so you can move it somewhere else
+-    fn detach() { return std::move( _deferred ); }
++    fn detach()
++    {
++        fn f = std::move( _deferred );
++        _deferred = nullptr;
++        return f;
++    }
+ 
+     // Cause the deferred call to be invoked NOW (throws if nothing there!)
+     void execute() { _deferred(); }
 diff --git a/tools/CMakeLists.txt b/tools/CMakeLists.txt
 index 399578c4f..a5f459c2f 100644
 --- a/tools/CMakeLists.txt
