@@ -565,10 +565,28 @@ index 8a148ca3e..411a00b30 100644
              std::vector<hid_profile> _hid_profiles;
              std::map<int, std::string> _id_to_sensor;
 diff --git a/src/libusb/handle-libusb.h b/src/libusb/handle-libusb.h
-index 132215280..70d902478 100644
+index 132215280..cd67f0170 100644
 --- a/src/libusb/handle-libusb.h
 +++ b/src/libusb/handle-libusb.h
-@@ -54,6 +54,19 @@ namespace librealsense
+@@ -7,6 +7,7 @@
+ #include "context-libusb.h"
+ 
+ #include <chrono>
++#include <mutex>
+ 
+ #include "libusb.h"
+ 
+@@ -44,6 +45,9 @@ namespace librealsense
+             handle_libusb(std::shared_ptr<usb_context> context, libusb_device* device, std::shared_ptr<usb_interface_libusb> interface) :
+                     _first_interface(interface), _context(context), _handle(nullptr)
+             {
++#ifdef __APPLE__
++                std::lock_guard< std::mutex > lock( darwin_handle_mutex() );
++#endif
+                 auto sts = libusb_open(device, &_handle);
+                 if(sts != LIBUSB_SUCCESS)
+                 {
+@@ -54,6 +58,19 @@ namespace librealsense
                      throw std::runtime_error(msg.str());
                  }
  
@@ -588,7 +606,7 @@ index 132215280..70d902478 100644
                  sts = libusb_set_auto_detach_kernel_driver(_handle, true); // detach from kernel driver when claimed and re-attach when released.
                  if(sts != LIBUSB_SUCCESS)
                  {
-@@ -63,6 +76,7 @@ namespace librealsense
+@@ -63,6 +80,7 @@ namespace librealsense
                      LOG_ERROR(msg.str());
                      throw std::runtime_error(msg.str());
                  }
@@ -596,6 +614,33 @@ index 132215280..70d902478 100644
  
                  claim_interface_or_throw(interface->get_number());
                  for(auto&& i : interface->get_associated_interfaces())
+@@ -74,6 +92,9 @@ namespace librealsense
+             ~handle_libusb()
+             {
+                 _context->stop_event_handler();
++#ifdef __APPLE__
++                std::lock_guard< std::mutex > lock( darwin_handle_mutex() );
++#endif
+                 for(auto&& i : _first_interface->get_associated_interfaces())
+                     libusb_release_interface(_handle, i->get_number());
+                 libusb_release_interface(_handle, _first_interface->get_number());
+@@ -86,6 +107,16 @@ namespace librealsense
+             }
+ 
+         private:
++#ifdef __APPLE__
++            // libusb's macOS backend keeps per-device open/capture state that is not thread safe, and capturing the
++            // device re-opens it under its other handles, so handles are opened and closed one at a time.
++            static std::mutex & darwin_handle_mutex()
++            {
++                static std::mutex m;
++                return m;
++            }
++#endif
++
+             void claim_interface_or_throw(uint8_t interface)
+             {
+                 auto rs_sts = claim_interface(interface);
 diff --git a/src/libusb/messenger-libusb.cpp b/src/libusb/messenger-libusb.cpp
 index 6f56eef0c..d6493cea4 100644
 --- a/src/libusb/messenger-libusb.cpp
@@ -609,6 +654,46 @@ index 6f56eef0c..d6493cea4 100644
                  return libusb_status_to_rs(sts);
              }
              transferred = uint32_t(sts);
+diff --git a/src/uvc/uvc-device.cpp b/src/uvc/uvc-device.cpp
+index 9488d749e..28f920b3a 100644
+--- a/src/uvc/uvc-device.cpp
++++ b/src/uvc/uvc-device.cpp
+@@ -15,6 +15,8 @@
+ #define SWAP_UINT32(x) (((x) >> 24) | (((x) & 0x00FF0000) >> 8) | (((x) & 0x0000FF00) << 8) | ((x) << 24))
+ 
+ const int CONTROL_TRANSFER_TIMEOUT = 100;
++// Processing-unit and probe/commit requests: same limit as the Linux uvcvideo driver (0 waits forever for a stuck camera)
++const int UVC_REQUEST_TIMEOUT = 5000;
+ const int INTERRUPT_BUFFER_SIZE = 1024;
+ const int FIRST_FRAME_MILLISECONDS_TIMEOUT = 2000;
+ 
+@@ -515,7 +517,7 @@ namespace librealsense
+                             buffer,
+                             sizeof(int32_t),
+                             transferred,
+-                            0);
++                            UVC_REQUEST_TIMEOUT);
+                 }
+ 
+             }, [this](){ return !_messenger; });
+@@ -605,7 +607,7 @@ namespace librealsense
+                           buffer,
+                           sizeof(int32_t),
+                           transferred,
+-                          0);
++                          UVC_REQUEST_TIMEOUT);
+                 }
+ 
+             }, [this](){ return !_messenger; });
+@@ -867,7 +869,7 @@ namespace librealsense
+                                 req,
+                                 probe ? (UVC_VS_PROBE_CONTROL << 8) : (UVC_VS_COMMIT_CONTROL << 8),
+                                 ctrl->bInterfaceNumber, // When requestType is directed to an interface, the driver automatically passes the interface number in the low byte of index
+-                                buf, static_cast<uint32_t>(len), transferred, 0);
++                                buf, static_cast<uint32_t>(len), transferred, UVC_REQUEST_TIMEOUT);
+                     } while (sts != RS2_USB_STATUS_SUCCESS && retries++ < 5);
+                 }
+             }, [this](){ return !_messenger; });
 diff --git a/third-party/glfw/CMakeLists.txt b/third-party/glfw/CMakeLists.txt
 index 5d94254d8..19dc6d84a 100644
 --- a/third-party/glfw/CMakeLists.txt

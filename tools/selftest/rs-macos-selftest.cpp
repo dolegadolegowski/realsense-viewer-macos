@@ -15,6 +15,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <algorithm>
 
 #include <unistd.h>
 #include <cstdio>
@@ -141,6 +142,64 @@ try
     report( (bool)depth_sensor, "stereo module present" );
     report( (bool)color_sensor, "RGB camera present" );
     report( (bool)motion_sensor, "motion module (IMU) present" );
+
+    // Parallel access to all sensors, like the viewer does when it builds its device panel
+    {
+        std::atomic< int > errors{ 0 };
+        std::string first_error;
+        std::mutex error_mutex;
+        std::vector< std::thread > threads;
+        for( auto s : dev.query_sensors() )
+            threads.emplace_back( [&, s]() mutable {
+                for( int i = 0; i < 10; ++i )
+                {
+                    try
+                    {
+                        s.get_stream_profiles();
+                        for( auto opt : s.get_supported_options() )
+                            if( ! s.is_option_read_only( opt ) )
+                                s.get_option( opt );
+                    }
+                    catch( const std::exception & e )
+                    {
+                        std::lock_guard< std::mutex > l( error_mutex );
+                        if( errors++ == 0 )
+                            first_error = e.what();
+                    }
+                }
+            } );
+        for( auto & t : threads )
+            t.join();
+        report( errors == 0, "parallel profile/option queries on all sensors" + ( errors ? " (" + first_error + ")" : std::string() ) );
+    }
+
+    // Visual presets (the viewer's "Preset" list) - each is a batch of advanced-mode commands
+    if( depth_sensor && depth_sensor.supports( RS2_OPTION_VISUAL_PRESET ) )
+    {
+        auto range = depth_sensor.get_option_range( RS2_OPTION_VISUAL_PRESET );
+        float original = depth_sensor.get_option( RS2_OPTION_VISUAL_PRESET );
+        bool ok = true;
+        long long slowest = 0;
+        std::string failed;
+        for( float v = range.min; v <= range.max; v += range.step )
+        {
+            auto t0 = std::chrono::steady_clock::now();
+            try
+            {
+                depth_sensor.set_option( RS2_OPTION_VISUAL_PRESET, v );
+            }
+            catch( const std::exception & e )
+            {
+                ok = false;
+                failed += std::string( " " ) + depth_sensor.get_option_value_description( RS2_OPTION_VISUAL_PRESET, v ) + ": " + e.what();
+            }
+            auto ms = std::chrono::duration_cast< std::chrono::milliseconds >( std::chrono::steady_clock::now() - t0 ).count();
+            slowest = std::max( slowest, (long long)ms );
+        }
+        depth_sensor.set_option( RS2_OPTION_VISUAL_PRESET, original );
+        report( ok && slowest < 10000,
+                "visual presets " + std::to_string( (int)range.min ) + ".." + std::to_string( (int)range.max ) + " (slowest " + std::to_string( slowest ) + " ms)" + failed );
+    }
 
     // Options (UVC extension units + processing units)
     if( depth_sensor && depth_sensor.supports( RS2_OPTION_LASER_POWER ) )
