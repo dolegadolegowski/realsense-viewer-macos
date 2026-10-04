@@ -39,6 +39,72 @@ index 5ec1bb8b1..41f3bb5b2 100644
 +  find_library(security_lib Security)
 +  target_link_libraries(usb INTERFACE objc ${corefoundation_lib} ${iokit_lib} ${security_lib})
  endif()
+diff --git a/common/os.cpp b/common/os.cpp
+index 26eb5b052..030339dce 100644
+--- a/common/os.cpp
++++ b/common/os.cpp
+@@ -44,6 +44,44 @@
+ 
+ #include <GLFW/glfw3.h>
+ 
++#ifdef __APPLE__
++#include <dirent.h>
++#include <mutex>
++
++namespace
++{
++    // Camera access needs root on macOS, so the viewer runs through sudo (or an equivalent launcher). Files saved
++    // through the dialogs are handed back to the invoking user on exit, including any extension or sidecar added
++    // to the chosen name (e.g. ".db3" for recordings).
++    struct sudo_saved_files
++    {
++        std::mutex mutex;
++        std::vector< std::string > paths;
++
++        ~sudo_saved_files()
++        {
++            const char * uid = getenv( "SUDO_UID" );
++            const char * gid = getenv( "SUDO_GID" );
++            if( geteuid() != 0 || ! uid || ! gid )
++                return;
++            for( auto & path : paths )
++            {
++                auto slash = path.find_last_of( '/' );
++                std::string dir = slash == std::string::npos ? "." : path.substr( 0, slash );
++                std::string name = path.substr( slash + 1 );
++                if( DIR * d = opendir( dir.c_str() ) )
++                {
++                    while( dirent * entry = readdir( d ) )
++                        if( std::string( entry->d_name ).compare( 0, name.size(), name ) == 0 )
++                            chown( ( dir + '/' + entry->d_name ).c_str(), (uid_t)atoi( uid ), (gid_t)atoi( gid ) );
++                    closedir( d );
++                }
++            }
++        }
++    } sudo_saved_files_owner;
++}
++#endif
++
+ namespace rs2
+ {
+     // Use shortcuts for long names to avoid trimming of essential data
+@@ -228,7 +266,15 @@ Some auxillary functionalities might be affected. Please report this message if
+ 
+         if (flags == save_file)
+         {
+-            return tinyfd_saveFileDialog("Save File", def_ptr, filters_count, aFilterPatterns, aSingleFilterDescription);
++            auto ret = tinyfd_saveFileDialog("Save File", def_ptr, filters_count, aFilterPatterns, aSingleFilterDescription);
++#ifdef __APPLE__
++            if( ret )
++            {
++                std::lock_guard< std::mutex > lock( sudo_saved_files_owner.mutex );
++                sudo_saved_files_owner.paths.push_back( ret );
++            }
++#endif
++            return ret;
+         }
+         if (flags == open_file)
+         {
 diff --git a/common/ux-window.cpp b/common/ux-window.cpp
 index f7c154005..ef807a4c9 100644
 --- a/common/ux-window.cpp
