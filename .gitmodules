@@ -1,0 +1,4 @@
+[submodule "third_party/librealsense"]
+	path = third_party/librealsense
+	url = https://github.com/realsenseai/librealsense.git
+	shallow = true

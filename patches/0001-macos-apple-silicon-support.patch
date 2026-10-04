@@ -1,0 +1,621 @@
+diff --git a/CMake/external_libusb.cmake b/CMake/external_libusb.cmake
+index 5ec1bb8b1..41f3bb5b2 100644
+--- a/CMake/external_libusb.cmake
++++ b/CMake/external_libusb.cmake
+@@ -4,7 +4,7 @@ ExternalProject_Add(
+     libusb
+     PREFIX libusb
+     GIT_REPOSITORY "https://github.com/libusb/libusb-cmake.git"
+-    GIT_TAG "v1.0.27-1" # "v1.0.27-1" 
++    GIT_TAG "v1.0.30-0" # "v1.0.30-0" 
+ 
+     UPDATE_COMMAND ""
+     PATCH_COMMAND ""
+@@ -13,6 +13,8 @@ ExternalProject_Add(
+     CMAKE_ARGS -DCMAKE_CXX_STANDARD_LIBRARIES=${CMAKE_CXX_STANDARD_LIBRARIES}
+             -DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}
+             -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
++            -DCMAKE_OSX_ARCHITECTURES=${CMAKE_OSX_ARCHITECTURES}
++            -DCMAKE_OSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}
+             -DANDROID_ABI=${ANDROID_ABI}
+             -DANDROID_STL=${ANDROID_STL}
+             -DBUILD_SHARED_LIBS=OFF
+@@ -24,8 +26,8 @@ ExternalProject_Add(
+ )
+ 
+ add_library(usb INTERFACE)
+-target_include_directories(usb INTERFACE $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/third-party/libusb/libusb>)
+-target_link_libraries(usb INTERFACE ${CMAKE_CURRENT_BINARY_DIR}/libusb_install/lib/${CMAKE_STATIC_LIBRARY_PREFIX}libusb-1.0${CMAKE_STATIC_LIBRARY_SUFFIX})
++target_include_directories(usb INTERFACE $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/libusb_install/include/libusb-1.0>)
++target_link_libraries(usb INTERFACE ${CMAKE_CURRENT_BINARY_DIR}/libusb_install/lib/${CMAKE_STATIC_LIBRARY_PREFIX}usb-1.0${CMAKE_STATIC_LIBRARY_SUFFIX})
+ set(USE_EXTERNAL_USB ON) # INTERFACE libraries can't have real deps, so targets that link with usb need to also depend on libusb
+ 
+ set_target_properties( libusb PROPERTIES FOLDER "3rd Party")
+@@ -33,5 +35,6 @@ set_target_properties( libusb PROPERTIES FOLDER "3rd Party")
+ if (APPLE)
+   find_library(corefoundation_lib CoreFoundation)
+   find_library(iokit_lib IOKit)
+-  target_link_libraries(usb INTERFACE objc ${corefoundation_lib} ${iokit_lib})
++  find_library(security_lib Security)
++  target_link_libraries(usb INTERFACE objc ${corefoundation_lib} ${iokit_lib} ${security_lib})
+ endif()
+diff --git a/common/ux-window.cpp b/common/ux-window.cpp
+index f7c154005..ef807a4c9 100644
+--- a/common/ux-window.cpp
++++ b/common/ux-window.cpp
+@@ -31,12 +31,17 @@
+ #include <opengl3.h>
+ 
+ #include <iostream>
++#include <csignal>
+ 
+ void glfw_error_callback(int error, const char* description)
+ {
+     std::cerr << "GLFW Driver Error: " << description << "\n";
+ }
+ 
++// Termination signals close the window like the user would, so devices are stopped and released cleanly
++static volatile std::sig_atomic_t quit_signaled = 0;
++static void on_quit_signal( int ) { quit_signaled = 1; }
++
+ 
+ namespace rs2
+ {
+@@ -481,6 +486,8 @@ namespace rs2
+         _first_frame(true), _query_devices(true), _missing_device(false),
+         _hourglass_index(0), _dev_stat_message{}, _keep_alive(true), _title(title), _ctx(ctx)
+     {
++        for( int sig : { SIGINT, SIGTERM } )
++            std::signal( sig, on_quit_signal );
+         open_window();
+ 
+         // Apply initial UI state
+@@ -601,7 +608,7 @@ namespace rs2
+             std::this_thread::sleep_for(std::chrono::milliseconds(10));
+         }
+ 
+-        auto res = !glfwWindowShouldClose(_win);
++        auto res = !glfwWindowShouldClose(_win) && !quit_signaled;
+ 
+ 
+         if (_first_frame)
+@@ -627,7 +634,7 @@ namespace rs2
+         // If we are just getting started, render the Splash Screen instead of normal UI
+         while (res && (!_app_ready || _splash_timer.get_elapsed_ms() < 2000.f))
+         {
+-            res = !glfwWindowShouldClose(_win);
++            res = !glfwWindowShouldClose(_win) && !quit_signaled;
+             glfwPollEvents();
+ 
+             begin_frame();
+diff --git a/src/ds/d400/d400-factory.cpp b/src/ds/d400/d400-factory.cpp
+index 2ff1a6aed..39f19c496 100644
+--- a/src/ds/d400/d400-factory.cpp
++++ b/src/ds/d400/d400-factory.cpp
+@@ -860,9 +860,7 @@ namespace librealsense
+             , firmware_logger_device( dev_info, d400_device::_hw_monitor, get_firmware_logs_command(), get_flash_logs_command() )
+         {
+             ds_advanced_mode_base::initialize_advanced_mode( this );
+-#if !defined(__APPLE__) // Motion sensors not supported on macOS
+             register_gyro_sensitivity();
+-#endif
+         }
+ 
+ 
+@@ -1071,9 +1069,7 @@ namespace librealsense
+             , ds_thermal_tracking( d400_device::_thermal_monitor )
+         {
+             ds_advanced_mode_base::initialize_advanced_mode( this );
+-#if !defined(__APPLE__) // Motion sensors not supported on macOS
+             register_gyro_sensitivity();
+-#endif
+         }
+ 
+         std::shared_ptr<matcher> create_matcher(const frame_holder& frame) const override;
+@@ -1213,7 +1209,6 @@ namespace librealsense
+             auto is_pid_of_multisensor_device = [](int pid) { return std::find(std::begin(ds::d400_multi_sensors_pid), std::end(ds::d400_multi_sensors_pid), pid) != std::end(ds::d400_multi_sensors_pid); };
+             auto is_pid_of_mipi_device = [](int pid) { return std::find(std::begin(ds::d400_mipi_device_pid), std::end(ds::d400_mipi_device_pid), pid) != std::end(ds::d400_mipi_device_pid); };
+ 
+-#if !defined(__APPLE__) // Not supported by macos
+             auto is_pid_of_hid_sensor_device = [](int pid) { return std::find(std::begin(ds::d400_hid_sensors_pid),
+                 std::end(ds::d400_hid_sensors_pid), pid) != std::end(ds::d400_hid_sensors_pid); };
+             bool is_device_hid_sensor = false;
+@@ -1222,7 +1217,6 @@ namespace librealsense
+                 if (is_pid_of_hid_sensor_device(uvc.pid))
+                     is_device_hid_sensor = true;
+             }
+-#endif
+ 
+             if (!devices.empty() && is_mi_0_present)
+             {
+diff --git a/src/ds/d400/d400-motion.cpp b/src/ds/d400/d400-motion.cpp
+index cc9048a0a..918c29aa6 100644
+--- a/src/ds/d400/d400-motion.cpp
++++ b/src/ds/d400/d400-motion.cpp
+@@ -171,7 +171,6 @@ namespace librealsense
+ 
+             initialize_fisheye_sensor( dev_info->get_context(), dev_info->get_group() );
+ 
+-#if !defined(__APPLE__) // Motion sensors not supported on macOS
+             // Try to add HID endpoint
+             auto hid_ep = create_hid_device( dev_info->get_context(), dev_info->get_group().hid_devices );
+             if (hid_ep)
+@@ -184,7 +183,6 @@ namespace librealsense
+             //for FW >=5.16 the scale factor changes to 1000.0 since FW sends 32bit
+             if (_fw_version >= firmware_version( 5, 16, 0, 0))
+                 get_raw_motion_sensor()->set_gyro_scale_factor( 10000.0 );
+-#endif
+         }
+         catch (const std::exception& e)
+         {
+@@ -203,21 +201,13 @@ namespace librealsense
+ 
+     ds_motion_sensor & d400_motion::get_motion_sensor()
+     {
+-#if defined(__APPLE__)
+-        throw std::runtime_error("Motion sensors are not supported on macOS");
+-#else
+         return dynamic_cast< ds_motion_sensor & >( get_sensor( _motion_module_device_idx.value() ) );
+-#endif
+     }
+ 
+     std::shared_ptr<hid_sensor> d400_motion::get_raw_motion_sensor()
+     {
+-#if defined(__APPLE__)
+-        return nullptr;
+-#else
+         auto raw_sensor = get_motion_sensor().get_raw_sensor();
+         return std::dynamic_pointer_cast< hid_sensor >( raw_sensor );
+-#endif
+     }
+ 
+     d400_motion_uvc::d400_motion_uvc( std::shared_ptr< const d400_info > const & dev_info )
+@@ -245,7 +235,6 @@ namespace librealsense
+                 _pid = uvc_infos.front().pid;
+             }
+ 
+-#if !defined(__APPLE__) // Motion sensors not supported on macOS
+             // Try to add HID endpoint
+             std::shared_ptr<synthetic_sensor> sensor_ep;
+             sensor_ep = create_uvc_device(dev_info->get_context(), dev_info->get_group().uvc_devices, _fw_version);
+@@ -256,7 +245,6 @@ namespace librealsense
+                 // HID metadata attributes - D457 dev - check metadata parser
+                 sensor_ep->get_raw_sensor()->register_metadata(RS2_FRAME_METADATA_FRAME_TIMESTAMP, make_hid_header_parser(&hid_header::timestamp));
+             }
+-#endif
+         } 
+         catch (const std::exception& e)
+         {
+diff --git a/src/ds/d500/d500-motion.cpp b/src/ds/d500/d500-motion.cpp
+index fc8855a7e..fc8c0aa0d 100644
+--- a/src/ds/d500/d500-motion.cpp
++++ b/src/ds/d500/d500-motion.cpp
+@@ -78,7 +78,6 @@ namespace librealsense
+ 
+             using namespace ds;
+ 
+-#if !defined(__APPLE__) // Motion sensors not supported on macOS
+             std::shared_ptr<synthetic_sensor> sensor_ep;
+             if( _is_mipi_device )
+             {
+@@ -111,7 +110,6 @@ namespace librealsense
+                 if( get_pid() != D585S_PID && ! _is_mipi_device )
+                     get_raw_motion_sensor()->set_gyro_scale_factor( 10000.0 );
+             }
+-#endif
+         }
+         catch (const std::exception& e)
+         {
+@@ -186,21 +184,13 @@ namespace librealsense
+ 
+     ds_motion_sensor & d500_motion::get_motion_sensor()
+     {
+-#if defined(__APPLE__)
+-        throw std::runtime_error( "Motion sensors are not supported on macOS" );
+-#else
+         return dynamic_cast< ds_motion_sensor & >( get_sensor( _motion_module_device_idx.value() ) );
+-#endif
+     }
+ 
+     std::shared_ptr< hid_sensor > d500_motion::get_raw_motion_sensor()
+     {
+-#if defined(__APPLE__)
+-        return nullptr;
+-#else
+         auto raw_sensor = get_motion_sensor().get_raw_sensor();
+         return std::dynamic_pointer_cast< hid_sensor >( raw_sensor );
+-#endif
+     }
+ 
+     void d500_motion::register_gyro_sensitivity()
+diff --git a/src/hid-sensor.cpp b/src/hid-sensor.cpp
+index bc2f3c845..c21a31063 100644
+--- a/src/hid-sensor.cpp
++++ b/src/hid-sensor.cpp
+@@ -166,10 +166,8 @@ static rs2_stream custom_gpio_to_stream_type( uint32_t custom_gpio )
+     {
+         return static_cast< rs2_stream >( RS2_STREAM_GPIO );
+     }
+-#ifndef __APPLE__
+     // TODO to be refactored/tested
+     LOG_ERROR( "custom_gpio " << std::to_string( custom_gpio ) << " is incorrect!" );
+-#endif
+     return RS2_STREAM_ANY;
+ }
+ 
+diff --git a/src/hid/CMakeLists.txt b/src/hid/CMakeLists.txt
+index 52051cb47..533e39572 100644
+--- a/src/hid/CMakeLists.txt
++++ b/src/hid/CMakeLists.txt
+@@ -6,20 +6,3 @@ target_sources(${LRS_TARGET}
+         "${CMAKE_CURRENT_LIST_DIR}/hid-device.h"
+         "${CMAKE_CURRENT_LIST_DIR}/hid-device.cpp"
+ )
+-
+-if(APPLE)
+-
+-    find_library(CoreFoundationLib CoreFoundation)
+-    find_library(IOKitLib IOKit)
+-
+-    target_sources(${LRS_TARGET}
+-        PRIVATE
+-            "${CMAKE_CURRENT_LIST_DIR}/../../third-party/hidapi/hidapi.h"
+-            "${CMAKE_CURRENT_LIST_DIR}/../../third-party/hidapi/hidapi.cpp"
+-    )
+-
+-    target_include_directories(${LRS_TARGET} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../../third-party/hidapi/)
+-
+-    target_link_libraries(${LRS_TARGET} PRIVATE ${CoreFoundationLib} ${IOKitLib})
+-
+-endif()
+diff --git a/src/hid/hid-device.cpp b/src/hid/hid-device.cpp
+index e73bbc762..fae02db0b 100644
+--- a/src/hid/hid-device.cpp
++++ b/src/hid/hid-device.cpp
+@@ -65,24 +65,11 @@ namespace librealsense
+             _sensor_to_id[gyro] = REPORT_ID_GYROMETER_3D;
+             _sensor_to_id[accel] = REPORT_ID_ACCELEROMETER_3D;
+             _sensor_to_id[custom] = REPORT_ID_CUSTOM;
+-#ifdef __APPLE__
+-            hidapi_device_info *devices = hid_enumerate(0x8086, 0x0);
+-            if(devices)
+-            {
+-                _hidapi_device = hid_open(devices[0].vendor_id, devices[0].product_id, devices[0].serial_number);
+-                hidapi_PowerDevice(REPORT_ID_ACCELEROMETER_3D);
+-                hidapi_PowerDevice(REPORT_ID_GYROMETER_3D);
+-            }
+-#endif
+             _action_dispatcher.start();
+         }
+ 
+         rs_hid_device::~rs_hid_device()
+         {
+-#ifdef __APPLE__
+-            if( _hidapi_device )
+-                hid_close( _hidapi_device );
+-#endif
+             _action_dispatcher.stop();
+         }
+ 
+@@ -117,7 +104,6 @@ namespace librealsense
+             {
+                 if(!_running)
+                     return;
+-#ifndef __APPLE__
+                 _request_callback->cancel();
+ 
+                 _queue.clear();
+@@ -126,11 +112,8 @@ namespace librealsense
+                     _messenger->cancel_request(r);
+ 
+                 _requests.clear();
+-#endif
+                 _handle_interrupts_thread->stop();
+-#ifndef __APPLE__
+                 _messenger.reset();
+-#endif
+                _running = false;
+             }, [this](){ return !_running; });
+         }
+@@ -143,10 +126,8 @@ namespace librealsense
+                     return;
+ 
+                 _callback = callback;
+-#ifndef __APPLE__
+                 auto in = get_hid_interface()->get_number();
+                 _messenger = _usb_device->open(in);
+-#endif
+                 _handle_interrupts_thread = std::make_shared<active_object<>>([this](dispatcher::cancellable_timer cancellable_timer)
+                 {
+                     handle_interrupt();
+@@ -154,7 +135,6 @@ namespace librealsense
+ 
+                 _handle_interrupts_thread->start();
+ 
+-#ifndef __APPLE__
+                 _request_callback = std::make_shared<usb_request_callback>([&](platform::rs_usb_request r)
+                     {
+                         _action_dispatcher.invoke([this, r](dispatcher::cancellable_timer c)
+@@ -210,12 +190,9 @@ namespace librealsense
+                     r->set_buffer(std::vector<uint8_t>(sizeof(REALSENSE_HID_REPORT)));
+                     r->set_callback(_request_callback);
+                 }
+-#endif
+                 _running = true;
+-#ifndef __APPLE__
+                 for(auto&& r : _requests)
+                     _messenger->submit_request(r);
+-#endif
+ 
+             }, [this](){ return _running; });
+         }
+@@ -229,46 +206,6 @@ namespace librealsense
+             // For FW >= 5.16 we can just use memcpy as the structs size match
+            
+ 
+-#ifdef __APPLE__
+-            unsigned char tmp_buffer[100] = { 0 };
+-            hid_read( _hidapi_device, tmp_buffer, _realsense_hid_report_actual_size );
+-            if( _realsense_hid_report_actual_size != sizeof( REALSENSE_HID_REPORT ) )
+-            {
+-               
+-                // x,y,z are all short with: x at offset 10
+-                //                           y at offset 12
+-                //                           z at offset 14
+-                memcpy( &report, tmp_buffer, 10 );
+-                const int16_t * x = reinterpret_cast< const int16_t * >( tmp_buffer + 10 );
+-                const int16_t * y = reinterpret_cast< const int16_t * >( tmp_buffer + 12 );
+-                const int16_t * z = reinterpret_cast< const int16_t * >( tmp_buffer + 14 );
+-                report.x = *x;
+-                report.y = *y;
+-                report.z = *z;
+-
+-                // the rest of the data in the old struct size (after z element) starts from offset 16 and has 16 bytes till end
+-                memcpy( &report.customValue1, tmp_buffer + 16, 16 );
+-            }
+-            else
+-            {
+-                memcpy( &report, tmp_buffer, sizeof( REALSENSE_HID_REPORT ) );
+-            }
+-
+-            sensor_data data{};
+-            data.sensor = { _id_to_sensor[report.reportId] };
+-
+-            hid_data hid{};
+-            hid.x = report.x;
+-            hid.y = report.y;
+-            hid.z = report.z;
+-
+-            data.fo.pixels = &(hid.x);
+-            data.fo.metadata = &(report.timeStamp);
+-            data.fo.frame_size = sizeof(REALSENSE_HID_REPORT);
+-            data.fo.metadata_size = sizeof(report.timeStamp);
+-
+-            _callback(data);
+-#else
+             if(_queue.dequeue(&report, 10))
+             {
+                 if(std::find_if(_configured_profiles.begin(), _configured_profiles.end(), [&](hid_profile& p)
+@@ -293,7 +230,6 @@ namespace librealsense
+                     _callback(data);
+                 }
+             }
+-#endif
+         }
+ 
+         usb_status rs_hid_device::set_feature_report( unsigned char power, int report_id, int fps, double sensitivity)
+@@ -375,55 +311,6 @@ namespace librealsense
+             return res;
+         }
+ 
+-#ifdef __APPLE__
+-        int rs_hid_device::hidapi_PowerDevice(unsigned char reportId)
+-        {
+-            if (_hidapi_device == NULL)
+-                return -1;
+-
+-            REALSENSE_FEATURE_REPORT featureReport;
+-            int ret;
+-
+-            memset(&featureReport,0, sizeof(featureReport));
+-            featureReport.reportId = reportId;
+-            // Reading feature report.
+-            ret = hid_get_feature_report(_hidapi_device, (unsigned char *)
+-                                         &featureReport ,sizeof(featureReport) );
+-
+-            if (ret == -1) {
+-                LOG_ERROR("fail to read feature report from device");
+-                return ret;
+-            }
+-
+-            // change report to power the device to D0
+-
+-            featureReport.power = DEVICE_POWER_D0;
+-
+-            // Write feature report back.
+-            ret = hid_send_feature_report(_hidapi_device, (unsigned char *) &featureReport, sizeof(featureReport));
+-
+-            if (ret == -1) {
+-                LOG_ERROR("fail to write feature report from device");
+-                return ret;
+-            }
+-
+-            ret = hid_get_feature_report(_hidapi_device, (unsigned char *) &featureReport ,sizeof(featureReport) );
+-
+-            if (ret == -1) {
+-                LOG_ERROR("fail to read feature report from device");
+-                return ret;
+-            }
+-
+-            if (featureReport.power == DEVICE_POWER_D0) {
+-                LOG_INFO("Device is powered up");
+-            } else {
+-                LOG_INFO("Device is powered off");
+-                return -1;
+-            }
+-
+-            return 0;
+-        }
+-#endif
+ 
+         rs_usb_interface rs_hid_device::get_hid_interface()
+         {
+diff --git a/src/hid/hid-device.h b/src/hid/hid-device.h
+index 8a148ca3e..c5a8324c0 100644
+--- a/src/hid/hid-device.h
++++ b/src/hid/hid-device.h
+@@ -17,9 +17,6 @@
+ #include <thread>
+ #include "../types.h"
+ 
+-#ifdef __APPLE__
+-#include <hidapi.h>
+-#endif
+ 
+ namespace librealsense
+ {
+@@ -51,22 +48,15 @@ namespace librealsense
+             rs_usb_interface get_hid_interface();
+             //for gyro sensitivity the default value we set in feature report is 0.1, which is mapped in FW to 30.5 millideg/sec
+             usb_status set_feature_report( unsigned char power, int report_id, int fps = 0, double sensitivity = 0.1 );
+-#ifdef __APPLE__
+-           int hidapi_PowerDevice(unsigned char reportId);
+-#endif
+ 
+             bool _running = false;
+             dispatcher _action_dispatcher;
+ 
+             hid_callback _callback;
+             rs_usb_device _usb_device;
+-#ifdef __APPLE__
+-            hidapi_device* _hidapi_device = nullptr;
+-#else
+             rs_usb_messenger _messenger;
+             std::vector<rs_usb_request> _requests;
+             std::shared_ptr<platform::usb_request_callback> _request_callback;
+-#endif
+ 
+             std::vector<hid_profile> _hid_profiles;
+             std::map<int, std::string> _id_to_sensor;
+diff --git a/src/libusb/handle-libusb.h b/src/libusb/handle-libusb.h
+index 132215280..70d902478 100644
+--- a/src/libusb/handle-libusb.h
++++ b/src/libusb/handle-libusb.h
+@@ -54,6 +54,19 @@ namespace librealsense
+                     throw std::runtime_error(msg.str());
+                 }
+ 
++#ifdef __APPLE__
++                // macOS captures the whole device from the system drivers, and auto re-attach on release would re-enumerate it
++                // under the other open interfaces, so capture it once explicitly and keep it until the process exits.
++                if( libusb_kernel_driver_active( _handle, interface->get_number() ) == 1 )
++                    sts = libusb_detach_kernel_driver( _handle, interface->get_number() );
++                if( sts == LIBUSB_ERROR_ACCESS )
++                {
++                    libusb_close( _handle );
++                    const char * msg = "macOS requires administrator privileges (sudo) to access RealSense USB devices";
++                    LOG_ERROR( msg );
++                    throw std::runtime_error( msg );
++                }
++#else
+                 sts = libusb_set_auto_detach_kernel_driver(_handle, true); // detach from kernel driver when claimed and re-attach when released.
+                 if(sts != LIBUSB_SUCCESS)
+                 {
+@@ -63,6 +76,7 @@ namespace librealsense
+                     LOG_ERROR(msg.str());
+                     throw std::runtime_error(msg.str());
+                 }
++#endif
+ 
+                 claim_interface_or_throw(interface->get_number());
+                 for(auto&& i : interface->get_associated_interfaces())
+diff --git a/src/libusb/messenger-libusb.cpp b/src/libusb/messenger-libusb.cpp
+index 6f56eef0c..d6493cea4 100644
+--- a/src/libusb/messenger-libusb.cpp
++++ b/src/libusb/messenger-libusb.cpp
+@@ -39,7 +39,7 @@ namespace librealsense
+             if(sts < 0)
+             {
+                 std::string strerr = strerror(errno);
+-                LOG_WARNING("control_transfer returned error, index: " << index << ", error: " << strerr << ", number: " << int(errno));
++                LOG_WARNING("control_transfer returned error, index: " << index << ", error: " << libusb_error_name(sts) << " (errno: " << strerr << ", number: " << int(errno) << ")");
+                 return libusb_status_to_rs(sts);
+             }
+             transferred = uint32_t(sts);
+diff --git a/third-party/glfw/CMakeLists.txt b/third-party/glfw/CMakeLists.txt
+index 5d94254d8..19dc6d84a 100644
+--- a/third-party/glfw/CMakeLists.txt
++++ b/third-party/glfw/CMakeLists.txt
+@@ -18,7 +18,12 @@ set(GLFW_VERSION_FULL "${GLFW_VERSION}.${GLFW_VERSION_PATCH}${GLFW_VERSION_EXTRA
+ set_property(GLOBAL PROPERTY USE_FOLDERS ON)
+ 
+ #option(BUILD_SHARED_LIBS "Build shared libraries" ON)
+-set(BUILD_SHARED_LIBS OFF)
++# On macOS a static GLFW would be linked into both realsense2-gl and the tools, duplicating its Objective-C classes
++if(APPLE)
++    set(BUILD_SHARED_LIBS ON)
++else()
++    set(BUILD_SHARED_LIBS OFF)
++endif()
+ option(GLFW_BUILD_EXAMPLES "Build the GLFW example programs" OFF)
+ option(GLFW_BUILD_TESTS "Build the GLFW test programs" OFF)
+ option(GLFW_BUILD_DOCS "Build the GLFW documentation" OFF)
+diff --git a/third-party/imgui/imgui_impl_opengl3.cpp b/third-party/imgui/imgui_impl_opengl3.cpp
+index bbe96c420..f8b99cb16 100644
+--- a/third-party/imgui/imgui_impl_opengl3.cpp
++++ b/third-party/imgui/imgui_impl_opengl3.cpp
+@@ -169,7 +169,8 @@
+ #endif
+ 
+ // Vertex arrays are not supported on ES2/WebGL1 unless Emscripten which uses an extension
+-#ifndef IMGUI_IMPL_OPENGL_ES2
++// (nor on the legacy 2.1 contexts librealsense tools create on macOS, which have no core VAOs)
++#if !defined(IMGUI_IMPL_OPENGL_ES2) && !defined(__APPLE__)
+ #define IMGUI_IMPL_OPENGL_USE_VERTEX_ARRAY
+ #elif defined(__EMSCRIPTEN__)
+ #define IMGUI_IMPL_OPENGL_USE_VERTEX_ARRAY
+@@ -306,7 +307,10 @@ bool    ImGui_ImplOpenGL3_Init(const char* glsl_version)
+     glGetIntegerv(GL_MAJOR_VERSION, &major);
+     glGetIntegerv(GL_MINOR_VERSION, &minor);
+     if (major == 0 && minor == 0)
++    {
++        glGetError(); // GL_MAJOR_VERSION is GL 3.0+, clear the GL_INVALID_ENUM it raised on GL 2.x
+         sscanf(gl_version_str, "%d.%d", &major, &minor); // Query GL_VERSION in desktop GL 2.x, the string will start with "<major>.<minor>"
++    }
+     bd->GlVersion = (GLuint)(major * 100 + minor * 10);
+ #if defined(GL_CONTEXT_PROFILE_MASK)
+     if (bd->GlVersion >= 320)
+@@ -350,7 +354,7 @@ bool    ImGui_ImplOpenGL3_Init(const char* glsl_version)
+ #elif defined(IMGUI_IMPL_OPENGL_ES3)
+         glsl_version = "#version 300 es";
+ #elif defined(__APPLE__)
+-        glsl_version = "#version 150";
++        glsl_version = bd->GlVersion >= 320 ? "#version 150" : "#version 120"; // legacy (2.1) macOS contexts only support GLSL 1.20
+ #else
+         glsl_version = "#version 130";
+ #endif
+@@ -371,7 +375,8 @@ bool    ImGui_ImplOpenGL3_Init(const char* glsl_version)
+     bd->HasClipOrigin = (bd->GlVersion >= 450);
+ #ifdef IMGUI_IMPL_OPENGL_HAS_EXTENSIONS
+     GLint num_extensions = 0;
+-    glGetIntegerv(GL_NUM_EXTENSIONS, &num_extensions);
++    if (bd->GlVersion >= 300) // GL_NUM_EXTENSIONS is GL 3.0+ (legacy macOS contexts are 2.1)
++        glGetIntegerv(GL_NUM_EXTENSIONS, &num_extensions);
+     for (GLint i = 0; i < num_extensions; i++)
+     {
+         const char* extension = (const char*)glGetStringi(GL_EXTENSIONS, i);
+diff --git a/tools/CMakeLists.txt b/tools/CMakeLists.txt
+index 399578c4f..a5f459c2f 100644
+--- a/tools/CMakeLists.txt
++++ b/tools/CMakeLists.txt
+@@ -35,9 +35,7 @@ if(BUILD_EXAMPLES)
+         endif()
+         set(DEPENDENCIES ${DEPENDENCIES} realsense2-gl)
+         add_subdirectory(data-collect)
+-        if(NOT APPLE)
+-            add_subdirectory(realsense-viewer)
+-        endif()
++        add_subdirectory(realsense-viewer)
+         add_subdirectory(depth-quality)
+         add_subdirectory(rosbag-inspector)
+         add_subdirectory(benchmark)
