@@ -17,7 +17,7 @@
 #include <string.h>
 #include <unistd.h>
 
-static const SInt32 REALSENSE_VIDS[] = { 0x8086, 0x2AAD };  // Intel, RealSense Inc.
+static const SInt32 REALSENSE_VIDS[] = { 0x8086, 0x38E5 };  // Intel, RealSense Inc. (src/usb/usb-types.h)
 
 static int is_realsense( io_service_t dev )
 {
