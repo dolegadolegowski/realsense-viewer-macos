@@ -31,8 +31,22 @@ Everything RealSense Viewer offers, running natively on Apple Silicon:
 | Device | Firmware info & update, hardware reset, on‑chip / focal‑length / tare calibration, firmware logs |
 | Extras | RealSense Depth Quality Tool, `rs-*` command line tools, `rs-macos-selftest` hardware self‑test |
 
-Tested on a MacBook Pro M4 Pro, macOS 27.0.1, RealSense **D455** (firmware 5.16.0.1) over USB 3.2:
-depth + IR + RGB at 30 fps and IMU at 400 Hz, simultaneously.
+### Verified
+
+On a MacBook Pro M4 Pro, macOS 27.0.1 (Golden Gate), RealSense **D455** (firmware 5.16.0.1) connected
+directly over USB‑C (USB 3.2):
+
+* the packaged **RealSense Viewer.app**: live depth/RGB in 2D and the textured point cloud in 3D;
+* the upstream **realsense-viewer GUI test suite** (ImGui Test Engine driving the real UI) — **9/9 passed**:
+  device detection, hardware reset, exposure, options filter, post‑processing, resolution selection,
+  streaming all sensors, streaming each sensor, memory‑leak soak test;
+* `rs-macos-selftest` — all checks pass: enumeration, hardware monitor, depth/RGB options, all 6 visual
+  presets (~350 ms each), parallel access to all sensors, depth + 2×IR at 30 fps, RGB 1280×720 at 30 fps,
+  accelerometer + gyroscope at 400 Hz, all sensors at once, recording to `.db3` and playback, repeated
+  start/stop of RGB/IMU while depth streams;
+* after quitting, the camera is handed back to macOS and works as a webcam again.
+
+Not tested on purpose: flashing firmware and writing calibration to the camera.
 
 ## Install
 
@@ -78,6 +92,9 @@ scripts/build.sh      # applies patches/ to librealsense v2.58.4 and builds ever
 scripts/package.sh    # creates dist/*.app, dist/RealSense Tools and the DMG
 ```
 
+The GitHub Actions workflow (`.github/workflows/build.yml`, macOS 27 runner) builds the DMG on demand
+(*Actions → build → Run workflow*), optionally attaching it to an existing release.
+
 `VIEWER_TESTS=ON scripts/build.sh` additionally builds `realsense-viewer-tests`, the upstream GUI test suite
 (ImGui Test Engine) that drives the real viewer UI: `sudo build/Release/realsense-viewer-tests --auto`.
 
@@ -85,13 +102,23 @@ scripts/package.sh    # creates dist/*.app, dist/RealSense Tools and the DMG
 
 All changes are in [`patches/0001-macos-apple-silicon-support.patch`](patches/0001-macos-apple-silicon-support.patch):
 
+* **Sensor power accounting (libc++)** — `rsutils::deferred` relied on the defaulted move of
+  `std::function`; libc++ keeps a moved‑from small `std::function`, so `x = sensor->bulk_operation()` released
+  the sensor's power twice. The depth and RGB power counters went negative and the sensors could never be
+  powered again (streams did not start, *"Device must be powered to query supported profiles!"*, preset
+  changes froze the viewer) while the IMU kept working. Moves now empty the source.
+* **No more infinite USB waits** — processing‑unit and probe/commit requests used timeout 0 (wait forever);
+  they now use 5 s like the Linux `uvcvideo` driver.
+* **Thread‑safe USB handles on macOS** — libusb's macOS backend keeps non‑thread‑safe per‑device state and
+  re‑opens the device when capturing it, so librealsense now opens/closes its USB handles one at a time.
+
 * **Viewer enabled on macOS** — `realsense-viewer` was excluded from macOS builds.
 * **USB device capture** — libusb on macOS captures the *whole* device and, with auto‑detach, re‑attaches the
   system drivers (re‑enumerating the device) whenever *any* interface is released, killing the streams of the
   other sensors. The camera is now captured once, explicitly, for the lifetime of the process, and a clear
   error is reported when administrator rights are missing.
 * **IMU / motion module** — the half‑finished hidapi code path is replaced by the regular libusb HID backend
-  (the same one used on Linux with the RSUSB backend); accelerometer and gyroscope stream at 200/400 Hz.
+  (the same one used on Linux with the RSUSB backend); accelerometer and gyroscope stream at up to 400 Hz.
 * **libusb 1.0.30** (statically linked; needs the Security framework on macOS).
 * **GLFW as a shared library** on macOS — it was linked statically into both `librealsense2-gl` and the
   tools, duplicating its Objective‑C classes (two GLFW states in one process).
@@ -113,8 +140,10 @@ macOS‑specific additions in this repository: the app launcher (`macos/launcher
   legacy OpenGL context).
 * Files saved outside *Documents* while the viewer runs are owned by root (readable by you; you can delete
   them, or `sudo chown` them).
-* Do not force‑quit (`kill -9`) the viewer while it talks to the camera: the camera firmware can hang and
-  then needs to be re‑plugged.
+* Quit the viewer normally (window close / ⌘Q). Killing it (`kill -9`) in the middle of a camera command can
+  leave the camera firmware unresponsive until it is re‑plugged.
+* A sporadic `control_transfer returned error … LIBUSB_ERROR_PIPE` warning in the log comes from the
+  firmware's error‑reporting control and is harmless (it also appears with the libusb backend on Linux).
 
 ## License
 
