@@ -40,32 +40,48 @@ index 5ec1bb8b1..41f3bb5b2 100644
 +  target_link_libraries(usb INTERFACE objc ${corefoundation_lib} ${iokit_lib} ${security_lib})
  endif()
 diff --git a/common/os.cpp b/common/os.cpp
-index 26eb5b052..030339dce 100644
+index 26eb5b052..44b742041 100644
 --- a/common/os.cpp
 +++ b/common/os.cpp
-@@ -44,6 +44,44 @@
+@@ -44,8 +44,95 @@
  
  #include <GLFW/glfw3.h>
  
 +#ifdef __APPLE__
 +#include <dirent.h>
++#include <fcntl.h>
++#include <ctime>
 +#include <mutex>
 +
 +namespace
 +{
-+    // Camera access needs root on macOS, so the viewer runs through sudo (or an equivalent launcher). Files saved
-+    // through the dialogs are handed back to the invoking user on exit, including any extension or sidecar added
-+    // to the chosen name (e.g. ".db3" for recordings).
++    // Camera access needs root on macOS, so the viewer may run as root for the user who started it (through sudo, or
++    // the app's launcher, which sets the same variables)
++    bool get_sudo_user( uid_t & uid, gid_t & gid )
++    {
++        const char * u = getenv( "SUDO_UID" );
++        const char * g = getenv( "SUDO_GID" );
++        if( geteuid() != 0 || ! u || ! g )
++            return false;
++        uid = (uid_t)atoi( u );
++        gid = (gid_t)atoi( g );
++        return true;
++    }
++
++    // Files saved through the dialogs are handed back to that user on exit, including any extension or sidecar added
++    // to the chosen name (e.g. ".db3" for recordings). Only regular files this process created qualify, changed through
++    // descriptors that don't follow links, so nothing planted in the folder can redirect the change.
 +    struct sudo_saved_files
 +    {
 +        std::mutex mutex;
 +        std::vector< std::string > paths;
++        time_t const started = time( nullptr );
 +
 +        ~sudo_saved_files()
 +        {
-+            const char * uid = getenv( "SUDO_UID" );
-+            const char * gid = getenv( "SUDO_GID" );
-+            if( geteuid() != 0 || ! uid || ! gid )
++            uid_t uid;
++            gid_t gid;
++            if( ! get_sudo_user( uid, gid ) )
 +                return;
 +            for( auto & path : paths )
 +            {
@@ -75,8 +91,17 @@ index 26eb5b052..030339dce 100644
 +                if( DIR * d = opendir( dir.c_str() ) )
 +                {
 +                    while( dirent * entry = readdir( d ) )
-+                        if( std::string( entry->d_name ).compare( 0, name.size(), name ) == 0 )
-+                            chown( ( dir + '/' + entry->d_name ).c_str(), (uid_t)atoi( uid ), (gid_t)atoi( gid ) );
++                    {
++                        if( std::string( entry->d_name ).compare( 0, name.size(), name ) != 0 )
++                            continue;
++                        int fd = openat( dirfd( d ), entry->d_name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC );
++                        struct stat st;
++                        if( fd >= 0 && fstat( fd, &st ) == 0 && S_ISREG( st.st_mode ) && st.st_uid == 0
++                            && st.st_nlink == 1 && st.st_birthtimespec.tv_sec >= started )
++                            fchown( fd, uid, gid );
++                        if( fd >= 0 )
++                            close( fd );
++                    }
 +                    closedir( d );
 +                }
 +            }
@@ -87,8 +112,34 @@ index 26eb5b052..030339dce 100644
 +
  namespace rs2
  {
++#ifdef __APPLE__
++    std::string open_for_sudo_user( std::string const & path )
++    {
++        uid_t uid;
++        gid_t gid;
++        if( ! get_sudo_user( uid, gid ) )
++            return path;
++        auto slash = path.find_last_of( '/' );
++        int dir = open( slash == std::string::npos ? "." : path.substr( 0, slash ).c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC );
++        struct stat st;
++        int fd = -1;
++        if( dir >= 0 && fstat( dir, &st ) == 0 && st.st_uid == uid )
++            fd = openat( dir, path.c_str() + slash + 1, O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0644 );
++        if( dir >= 0 )
++            close( dir );
++        if( fd >= 0 && ( fstat( fd, &st ) != 0 || ! S_ISREG( st.st_mode ) || st.st_nlink != 1 || fchown( fd, uid, gid ) != 0 ) )
++        {
++            close( fd );
++            fd = -1;
++        }
++        return fd < 0 ? std::string() : "/dev/fd/" + std::to_string( fd );  // stays open for whoever opens that path
++    }
++#endif
++
      // Use shortcuts for long names to avoid trimming of essential data
-@@ -228,7 +266,15 @@ Some auxillary functionalities might be affected. Please report this message if
+     std::string truncate_string(const std::string& str, size_t width)
+     {
+@@ -228,7 +315,15 @@ Some auxillary functionalities might be affected. Please report this message if
  
          if (flags == save_file)
          {
@@ -105,6 +156,38 @@ index 26eb5b052..030339dce 100644
          }
          if (flags == open_file)
          {
+diff --git a/common/os.h b/common/os.h
+index a02e14682..9deccb493 100644
+--- a/common/os.h
++++ b/common/os.h
+@@ -55,4 +55,10 @@ namespace rs2
+     std::string url_encode(const std::string &value);
+ 
+     bool is_debug();
++
++#ifdef __APPLE__
++    // Running as root for a sudo user: opens 'path' for appending only in a folder that user owns, and returns it as
++    // "/dev/fd/N" so the file can't be swapped for a link later. "" if refused, 'path' itself when not running as root.
++    std::string open_for_sudo_user( std::string const & path );
++#endif
+ }
+diff --git a/common/subdevice-model.cpp b/common/subdevice-model.cpp
+index dc1a8d0d0..d5fdd7e52 100644
+--- a/common/subdevice-model.cpp
++++ b/common/subdevice-model.cpp
+@@ -2172,7 +2172,11 @@ namespace rs2
+                     else
+                     {
+                         auto id = f.get_profile().unique_id();
+-                        viewer.ppf.frames_queue[id].enqueue(f);
++                        auto queue = [&]() {
++                            std::lock_guard< std::mutex > lock( viewer.streams_mutex );  // the UI thread adds and removes queues
++                            return viewer.ppf.frames_queue[id];
++                        }();
++                        queue.enqueue(f);
+ 
+                         on_frame();
+                     }
 diff --git a/common/ux-window.cpp b/common/ux-window.cpp
 index f7c154005..ef807a4c9 100644
 --- a/common/ux-window.cpp
@@ -154,6 +237,32 @@ index f7c154005..ef807a4c9 100644
              glfwPollEvents();
  
              begin_frame();
+diff --git a/common/viewer.cpp b/common/viewer.cpp
+index 25b593470..a1e892d77 100644
+--- a/common/viewer.cpp
++++ b/common/viewer.cpp
+@@ -1004,8 +1004,11 @@ namespace rs2
+         {
+             std::string filename = config_file::instance().get(
+                 configurations::viewer::log_filename);
+-
+-            rs2::log_to_file(min_severity, filename.c_str());
++#ifdef __APPLE__
++            filename = open_for_sudo_user( filename );  // the user-writable config must not pick what root writes
++#endif
++            if( ! filename.empty() )
++                rs2::log_to_file(min_severity, filename.c_str());
+         }
+ #endif
+ 
+@@ -3776,6 +3779,7 @@ namespace rs2
+         // Starting post processing filter rendering thread
+         ppf.start();
+         streams[p.unique_id()].begin_stream(d, p, *this);
++        std::lock_guard< std::mutex > lock( streams_mutex );  // sensor callbacks look queues up from their own threads
+         ppf.frames_queue.emplace(p.unique_id(), rs2::frame_queue(5));
+     }
+ 
 diff --git a/src/ds/d400/d400-factory.cpp b/src/ds/d400/d400-factory.cpp
 index 2ff1a6aed..39f19c496 100644
 --- a/src/ds/d400/d400-factory.cpp
@@ -294,6 +403,19 @@ index fc8855a7e..fc8c0aa0d 100644
      }
  
      void d500_motion::register_gyro_sensitivity()
+diff --git a/src/fw-update/fw-update-device.cpp b/src/fw-update/fw-update-device.cpp
+index 1c91481ff..e0e93d391 100644
+--- a/src/fw-update/fw-update-device.cpp
++++ b/src/fw-update/fw-update-device.cpp
+@@ -221,6 +221,8 @@ namespace librealsense
+             throw librealsense::invalid_value_exception("Device: " + get_serial_number() + " failed to update firmware\nImage is unsupported for this device or corrupted");
+ 
+         auto messenger = _usb_device->open(FW_UPDATE_INTERFACE_NUMBER);
++        if( ! messenger )
++            throw std::runtime_error( "Device: " + get_serial_number() + " failed to open the firmware update interface" );
+ 
+         const size_t transfer_size = 1024;
+ 
 diff --git a/src/hid-sensor.cpp b/src/hid-sensor.cpp
 index bc2f3c845..c21a31063 100644
 --- a/src/hid-sensor.cpp
@@ -335,7 +457,7 @@ index 52051cb47..533e39572 100644
 -
 -endif()
 diff --git a/src/hid/hid-device.cpp b/src/hid/hid-device.cpp
-index e73bbc762..fae02db0b 100644
+index e73bbc762..c9cffd59b 100644
 --- a/src/hid/hid-device.cpp
 +++ b/src/hid/hid-device.cpp
 @@ -65,24 +65,11 @@ namespace librealsense
@@ -383,7 +505,7 @@ index e73bbc762..fae02db0b 100644
                 _running = false;
              }, [this](){ return !_running; });
          }
-@@ -143,10 +126,8 @@ namespace librealsense
+@@ -143,10 +126,10 @@ namespace librealsense
                      return;
  
                  _callback = callback;
@@ -391,10 +513,12 @@ index e73bbc762..fae02db0b 100644
                  auto in = get_hid_interface()->get_number();
                  _messenger = _usb_device->open(in);
 -#endif
++                if( ! _messenger )
++                    throw std::runtime_error( "failed to open HID interface " + std::to_string( in ) );
                  _handle_interrupts_thread = std::make_shared<active_object<>>([this](dispatcher::cancellable_timer cancellable_timer)
                  {
                      handle_interrupt();
-@@ -154,7 +135,6 @@ namespace librealsense
+@@ -154,7 +137,6 @@ namespace librealsense
  
                  _handle_interrupts_thread->start();
  
@@ -402,7 +526,7 @@ index e73bbc762..fae02db0b 100644
                  _request_callback = std::make_shared<usb_request_callback>([&](platform::rs_usb_request r)
                      {
                          _action_dispatcher.invoke([this, r](dispatcher::cancellable_timer c)
-@@ -210,12 +190,9 @@ namespace librealsense
+@@ -210,12 +192,9 @@ namespace librealsense
                      r->set_buffer(std::vector<uint8_t>(sizeof(REALSENSE_HID_REPORT)));
                      r->set_callback(_request_callback);
                  }
@@ -415,7 +539,7 @@ index e73bbc762..fae02db0b 100644
  
              }, [this](){ return _running; });
          }
-@@ -229,46 +206,6 @@ namespace librealsense
+@@ -229,46 +208,6 @@ namespace librealsense
              // For FW >= 5.16 we can just use memcpy as the structs size match
             
  
@@ -462,7 +586,14 @@ index e73bbc762..fae02db0b 100644
              if(_queue.dequeue(&report, 10))
              {
                  if(std::find_if(_configured_profiles.begin(), _configured_profiles.end(), [&](hid_profile& p)
-@@ -293,7 +230,6 @@ namespace librealsense
+@@ -287,13 +226,12 @@ namespace librealsense
+ 
+                     data.fo.pixels = &(hid.x);
+                     data.fo.metadata = &(report.timeStamp);
+-                    data.fo.frame_size = sizeof(REALSENSE_HID_REPORT);
++                    data.fo.frame_size = sizeof(hid);
+                     data.fo.metadata_size = sizeof(report.timeStamp);
+ 
                      _callback(data);
                  }
              }
@@ -470,7 +601,7 @@ index e73bbc762..fae02db0b 100644
          }
  
          usb_status rs_hid_device::set_feature_report( unsigned char power, int report_id, int fps, double sensitivity)
-@@ -375,55 +311,6 @@ namespace librealsense
+@@ -375,55 +313,6 @@ namespace librealsense
              return res;
          }
  
@@ -565,7 +696,7 @@ index 8a148ca3e..411a00b30 100644
              std::vector<hid_profile> _hid_profiles;
              std::map<int, std::string> _id_to_sensor;
 diff --git a/src/libusb/handle-libusb.h b/src/libusb/handle-libusb.h
-index 132215280..cd67f0170 100644
+index 132215280..491f1cb24 100644
 --- a/src/libusb/handle-libusb.h
 +++ b/src/libusb/handle-libusb.h
 @@ -7,6 +7,7 @@
@@ -606,25 +737,46 @@ index 132215280..cd67f0170 100644
                  sts = libusb_set_auto_detach_kernel_driver(_handle, true); // detach from kernel driver when claimed and re-attach when released.
                  if(sts != LIBUSB_SUCCESS)
                  {
-@@ -63,6 +80,7 @@ namespace librealsense
+@@ -63,10 +80,20 @@ namespace librealsense
                      LOG_ERROR(msg.str());
                      throw std::runtime_error(msg.str());
                  }
 +#endif
  
-                 claim_interface_or_throw(interface->get_number());
-                 for(auto&& i : interface->get_associated_interfaces())
-@@ -74,6 +92,9 @@ namespace librealsense
+-                claim_interface_or_throw(interface->get_number());
+-                for(auto&& i : interface->get_associated_interfaces())
+-                    claim_interface_or_throw(i->get_number());
++                try
++                {
++                    claim_interface_or_throw(interface->get_number());
++                    for(auto&& i : interface->get_associated_interfaces())
++                        claim_interface_or_throw(i->get_number());
++                }
++                catch(...)
++                {
++                    // No destructor runs for us: give back what was claimed, or it stays taken until the camera is re-plugged
++                    release_and_close();
++                    throw;
++                }
+ 
+                 _context->start_event_handler();
+             }
+@@ -74,10 +101,10 @@ namespace librealsense
              ~handle_libusb()
              {
                  _context->stop_event_handler();
+-                for(auto&& i : _first_interface->get_associated_interfaces())
+-                    libusb_release_interface(_handle, i->get_number());
+-                libusb_release_interface(_handle, _first_interface->get_number());
+-                libusb_close(_handle);
 +#ifdef __APPLE__
 +                std::lock_guard< std::mutex > lock( darwin_handle_mutex() );
 +#endif
-                 for(auto&& i : _first_interface->get_associated_interfaces())
-                     libusb_release_interface(_handle, i->get_number());
-                 libusb_release_interface(_handle, _first_interface->get_number());
-@@ -86,6 +107,16 @@ namespace librealsense
++                release_and_close();
+             }
+ 
+             libusb_device_handle* get()
+@@ -86,6 +113,24 @@ namespace librealsense
              }
  
          private:
@@ -638,11 +790,19 @@ index 132215280..cd67f0170 100644
 +            }
 +#endif
 +
++            void release_and_close()
++            {
++                for(auto&& i : _first_interface->get_associated_interfaces())
++                    libusb_release_interface(_handle, i->get_number());
++                libusb_release_interface(_handle, _first_interface->get_number());
++                libusb_close(_handle);
++            }
++
              void claim_interface_or_throw(uint8_t interface)
              {
                  auto rs_sts = claim_interface(interface);
 diff --git a/src/libusb/messenger-libusb.cpp b/src/libusb/messenger-libusb.cpp
-index 6f56eef0c..da9ec1e79 100644
+index 6f56eef0c..0d0e18bf4 100644
 --- a/src/libusb/messenger-libusb.cpp
 +++ b/src/libusb/messenger-libusb.cpp
 @@ -39,7 +39,7 @@ namespace librealsense
@@ -654,8 +814,298 @@ index 6f56eef0c..da9ec1e79 100644
                  return libusb_status_to_rs(sts);
              }
              transferred = uint32_t(sts);
+@@ -88,9 +88,8 @@ namespace librealsense
+             if (sts < 0)
+             {
+                 req->set_active(false);
+-                std::string strerr = strerror(errno);
+-                LOG_WARNING("usb_request_queue returned error, endpoint: " << (int)request->get_endpoint()->get_address() << " error: " << strerr << ", number: " << (int)errno);
+-                return libusb_status_to_rs(errno);
++                LOG_WARNING("usb_request_queue returned error, endpoint: " << (int)request->get_endpoint()->get_address() << " error: " << libusb_error_name(sts));
++                return libusb_status_to_rs(sts);
+             }
+             return RS2_USB_STATUS_SUCCESS;
+         }
+@@ -101,9 +100,8 @@ namespace librealsense
+             auto sts = libusb_cancel_transfer(nr);
+             if (sts < 0 && sts != LIBUSB_ERROR_NOT_FOUND)
+             {
+-                std::string strerr = strerror(errno);
+-                LOG_WARNING("usb_request_cancel returned error, endpoint: " << (int)request->get_endpoint()->get_address() << " error: " << strerr << ", number: " << (int)errno);
+-                return libusb_status_to_rs(errno);
++                LOG_WARNING("usb_request_cancel returned error, endpoint: " << (int)request->get_endpoint()->get_address() << " error: " << libusb_error_name(sts));
++                return libusb_status_to_rs(sts);
+             }
+             return RS2_USB_STATUS_SUCCESS;
+         }
+diff --git a/src/libusb/request-libusb.cpp b/src/libusb/request-libusb.cpp
+index ed24fb84a..372a37bbc 100644
+--- a/src/libusb/request-libusb.cpp
++++ b/src/libusb/request-libusb.cpp
+@@ -5,23 +5,38 @@
+ #include "endpoint-libusb.h"
+ #include "device-libusb.h"
+ 
++#include <map>
++#include <mutex>
++
+ namespace librealsense
+ {
+     namespace platform
+     {
++        // Completions are serialized with request destruction: a request that gives up waiting for its cancelled transfer
++        // leaves the transfer and its buffer here, and the late completion frees them instead of touching the request
++        static std::mutex completion_mutex;
++        static std::map< libusb_transfer *, std::vector< uint8_t > > orphaned_buffers;
++
+         void internal_callback(struct  libusb_transfer* transfer)
+         {
+-            auto urb = reinterpret_cast<usb_request_libusb*>(transfer->user_data);
+-            if(urb)
++            std::shared_ptr< usb_request > response;
+             {
+-                urb->set_active(false);
+-                auto response = urb->get_shared();
+-                if(response)
++                std::lock_guard< std::mutex > lock( completion_mutex );
++                auto urb = reinterpret_cast<usb_request_libusb*>(transfer->user_data);
++                if( ! urb )
+                 {
+-                    auto cb = response->get_callback();
+-                    cb->callback(response);
++                    orphaned_buffers.erase( transfer );
++                    libusb_free_transfer( transfer );
++                    return;
+                 }
+-            }            
++                response = urb->get_shared();
++                urb->set_active(false);
++            }
++            if(response)
++            {
++                auto cb = response->get_callback();
++                cb->callback(response);
++            }
+         }
+ 
+         usb_request_libusb::usb_request_libusb(libusb_device_handle *dev_handle, rs_usb_endpoint endpoint)
+@@ -31,8 +46,6 @@ namespace librealsense
+             {
+                 if(!_active) 
+                     libusb_free_transfer(req);
+-                else
+-                    LOG_ERROR("active request didn't return on time");
+             } );
+             if (_endpoint->get_type() == RS2_USB_ENDPOINT_BULK)
+                 libusb_fill_bulk_transfer(_transfer.get(), dev_handle, _endpoint->get_address(), NULL, 0, internal_callback, NULL, 0);
+@@ -52,6 +65,14 @@ namespace librealsense
+             int attempts = 10;
+             while(_active && attempts--)
+                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
++
++            std::lock_guard< std::mutex > lock( completion_mutex );
++            if( _active )
++            {
++                LOG_WARNING( "active request didn't return on time" );
++                _transfer->user_data = nullptr;
++                orphaned_buffers[_transfer.get()] = std::move( _buffer );
++            }
+         }
+ 
+         void usb_request_libusb::set_active(bool state)
+diff --git a/src/libusb/request-libusb.h b/src/libusb/request-libusb.h
+index 9e4dbcb1f..923984567 100644
+--- a/src/libusb/request-libusb.h
++++ b/src/libusb/request-libusb.h
+@@ -7,6 +7,8 @@
+ #include "../usb/usb-request.h"
+ #include "../usb/usb-device.h"
+ 
++#include <atomic>
++
+ 
+ namespace librealsense
+ {
+@@ -32,7 +34,7 @@ namespace librealsense
+             virtual uint8_t* get_native_buffer() const override;
+ 
+         private:
+-            bool _active = false;
++            std::atomic< bool > _active{ false };
+             std::weak_ptr<usb_request> _shared;
+             std::shared_ptr<libusb_transfer> _transfer;
+         };
+diff --git a/src/media/record/record_sensor.cpp b/src/media/record/record_sensor.cpp
+index 12153a13b..786e1b143 100644
+--- a/src/media/record/record_sensor.cpp
++++ b/src/media/record/record_sensor.cpp
+@@ -281,15 +281,6 @@ processing_blocks librealsense::record_sensor::get_recommended_processing_blocks
+     return m_sensor.get_recommended_processing_blocks();
+ }
+ 
+-void record_sensor::record_frame(frame_holder frame)
+-{
+-    if(m_is_recording)
+-    {
+-        //Send to recording thread
+-        _on_frame( std::move( frame ) );
+-    }
+-}
+-
+ void record_sensor::enable_sensor_hooks()
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
+@@ -326,10 +317,20 @@ void record_sensor::hook_sensor_callbacks()
+ }
+ rs2_frame_callback_sptr librealsense::record_sensor::wrap_frame_callback( rs2_frame_callback_sptr callback )
+ {
++    // Same lifetime concern as the notifications lambda: a streaming thread can still be in here after *this is gone
++    auto lifetime = m_callback_lifetime;
++    auto self = this;
+     return make_frame_callback(
+-        [this, callback]( frame_holder frame )
++        [lifetime, self, callback]( frame_holder frame )
+         {
+-            record_frame( frame.clone() );
++            std::function< void( frame_holder ) > on_frame;
++            {
++                std::lock_guard< std::mutex > lock( lifetime->mutex );
++                if( lifetime->alive && self->m_is_recording )
++                    on_frame = self->_on_frame;
++            }
++            if( on_frame )
++                on_frame( frame.clone() );  // send to the recording thread
+ 
+             // Raise to user callback
+             frame_interface * ref = nullptr;
+diff --git a/src/media/record/record_sensor.h b/src/media/record/record_sensor.h
+index 0f1a20711..86b58ffc4 100644
+--- a/src/media/record/record_sensor.h
++++ b/src/media/record/record_sensor.h
+@@ -76,7 +76,6 @@ namespace librealsense
+         std::function< void( frame_holder ) > _on_frame;
+         std::function< void( rs2_extension, std::shared_ptr< extension_snapshot > ) > _on_extension_change;
+ 
+-        void record_frame(frame_holder holder);
+         void enable_sensor_hooks();
+         void disable_sensor_hooks();
+         void hook_sensor_callbacks();
+diff --git a/src/proc/neon/neon-align.cpp b/src/proc/neon/neon-align.cpp
+index 349091f0c..64bcb50f6 100644
+--- a/src/proc/neon/neon-align.cpp
++++ b/src/proc/neon/neon-align.cpp
+@@ -415,6 +415,8 @@ namespace librealsense
+         rs2::video_frame &aligned, const rs2::video_frame &depth,
+         const rs2::video_stream_profile &other_profile, float z_scale)
+     {
++        if( depth.get_width() * depth.get_height() % 8 )  // the vector loop has no tail and would run past the buffers
++            return align::align_z_to_other( aligned, depth, other_profile, z_scale );
+         uint8_t *aligned_data = reinterpret_cast<uint8_t *>(const_cast<void *>(aligned.get_data()));
+         auto aligned_profile = aligned.get_profile().as<rs2::video_stream_profile>();
+         memset(aligned_data, 0, aligned_profile.height() * aligned_profile.width() * aligned.get_bytes_per_pixel());
+@@ -441,6 +443,8 @@ namespace librealsense
+         rs2::video_frame &aligned, const rs2::video_frame &depth,
+         const rs2::video_frame &other, float z_scale)
+     {
++        if( depth.get_width() * depth.get_height() % 8 )  // the vector loop has no tail and would run past the buffers
++            return align::align_other_to_z( aligned, depth, other, z_scale );
+         uint8_t *aligned_data = reinterpret_cast<uint8_t *>(const_cast<void *>(aligned.get_data()));
+         auto aligned_profile = aligned.get_profile().as<rs2::video_stream_profile>();
+         memset(aligned_data, 0, aligned_profile.height() * aligned_profile.width() * aligned.get_bytes_per_pixel());
+diff --git a/src/proc/neon/neon-pointcloud.cpp b/src/proc/neon/neon-pointcloud.cpp
+index 6202e1ace..7e1491cd2 100644
+--- a/src/proc/neon/neon-pointcloud.cpp
++++ b/src/proc/neon/neon-pointcloud.cpp
+@@ -125,6 +125,8 @@ namespace librealsense
+         float *pre_compute_y = _pre_compute_map_y.data();
+ 
+         const uint32_t size = depth_intrinsics.height * depth_intrinsics.width;
++        if( size % 8 )  // the vector loop has no tail and would run past the buffers
++            return pointcloud::depth_to_points( output, depth_intrinsics, depth_frame );
+ 
+         auto points = (float *)output.get_vertices();
+         const auto scale = vdupq_n_f32(depth_frame.get_units());
+@@ -249,7 +251,9 @@ namespace librealsense
+                                           const rs2_extrinsics &extr,
+                                           float2 *pixels_ptr)
+     {
+-        if (other_intrinsics.model == RS2_DISTORTION_MODIFIED_BROWN_CONRADY)
++        if( width * height % 4 )  // the vector loop has no tail and would run past the buffers
++            pointcloud::get_texture_map( output, points, width, height, other_intrinsics, extr, pixels_ptr );
++        else if (other_intrinsics.model == RS2_DISTORTION_MODIFIED_BROWN_CONRADY)
+         {
+             get_texture_map_neon<RS2_DISTORTION_MODIFIED_BROWN_CONRADY>(
+                 (float2 *)output.get_texture_coordinates(),
+diff --git a/src/proc/spatial-filter.h b/src/proc/spatial-filter.h
+index 595fad5b7..50dec1bcc 100644
+--- a/src/proc/spatial-filter.h
++++ b/src/proc/spatial-filter.h
+@@ -251,6 +251,7 @@ namespace librealsense
+                 //Right to left
+                 for (size_t i = 1; i < _width; ++i)
+                 {
++                    --p;  // from the second-to-last pixel: the last one has no right neighbour in this row
+                     if (empty(p))
+                     {
+                         if (++cur_fill < _holes_filling_radius)
+@@ -258,7 +259,6 @@ namespace librealsense
+                     }
+                     else
+                         cur_fill = 0;
+-                    --p;
+                 }
+                 p += _width;
+             }
+diff --git a/src/source.cpp b/src/source.cpp
+index 769b37e9f..5f4ce0ef0 100644
+--- a/src/source.cpp
++++ b/src/source.cpp
+@@ -109,7 +109,7 @@ namespace librealsense
+     {
+         std::lock_guard< std::recursive_mutex > lock( _mutex );
+ 
+-        _callback.reset();
++        std::atomic_store( &_callback, rs2_frame_callback_sptr() );
+         _archive.clear();
+         _metadata_parsers.reset();
+     }
+@@ -144,16 +144,16 @@ namespace librealsense
+         }
+     }
+ 
++    // _callback is replaced while streaming threads invoke it, and those threads can't take _mutex (flush() holds it
++    // while waiting for them), so it is only accessed atomically
+     void frame_source::set_callback( rs2_frame_callback_sptr callback )
+     {
+-        std::lock_guard< std::recursive_mutex > lock( _mutex );
+-        _callback = callback;
++        std::atomic_store( &_callback, callback );
+     }
+ 
+     rs2_frame_callback_sptr frame_source::get_callback() const
+     {
+-        std::lock_guard< std::recursive_mutex > lock( _mutex );
+-        return _callback;
++        return std::atomic_load( &_callback );
+     }
+ 
+     void frame_source::invoke_callback(frame_holder frame) const
+@@ -162,11 +162,11 @@ namespace librealsense
+         {
+             try
+             {
+-                if (_callback)
++                if( auto callback = get_callback() )  // the copy keeps it alive while it runs
+                 {
+                     frame_interface* ref = nullptr;
+                     std::swap(frame.frame, ref);
+-                    _callback->on_frame((rs2_frame*)ref);
++                    callback->on_frame((rs2_frame*)ref);
+                 }
+             }
+             catch( const std::exception & e )
 diff --git a/src/uvc/uvc-device.cpp b/src/uvc/uvc-device.cpp
-index 9488d749e..28f920b3a 100644
+index 9488d749e..78922b4e7 100644
 --- a/src/uvc/uvc-device.cpp
 +++ b/src/uvc/uvc-device.cpp
 @@ -15,6 +15,8 @@
@@ -685,15 +1135,67 @@ index 9488d749e..28f920b3a 100644
                  }
  
              }, [this](){ return !_messenger; });
-@@ -867,7 +869,7 @@ namespace librealsense
+@@ -619,7 +621,7 @@ namespace librealsense
+ 
+         bool rs_uvc_device::uvc_get_ctrl(uint8_t unit, uint8_t ctrl, void *data, int len, uvc_req_code req_code) const
+         {
+-            usb_status sts;
++            usb_status sts = RS2_USB_STATUS_OTHER;
+             _action_dispatcher.invoke_and_wait([&, this](dispatcher::cancellable_timer c)
+             {
+                 if (_messenger)
+@@ -642,7 +644,7 @@ namespace librealsense
+ 
+         bool rs_uvc_device::uvc_set_ctrl(uint8_t unit, uint8_t ctrl, void *data, int len)
+         {
+-            usb_status sts;
++            usb_status sts = RS2_USB_STATUS_OTHER;
+             _action_dispatcher.invoke_and_wait([&, this](dispatcher::cancellable_timer c)
+             {
+                 if (_messenger)
+@@ -854,7 +856,7 @@ namespace librealsense
+                 }
+             }
+ 
+-            usb_status sts;
++            usb_status sts = RS2_USB_STATUS_OTHER;
+             _action_dispatcher.invoke_and_wait([&, this](dispatcher::cancellable_timer c)
+             {
+                 if (_messenger)
+@@ -867,8 +869,9 @@ namespace librealsense
                                  req,
                                  probe ? (UVC_VS_PROBE_CONTROL << 8) : (UVC_VS_COMMIT_CONTROL << 8),
                                  ctrl->bInterfaceNumber, // When requestType is directed to an interface, the driver automatically passes the interface number in the low byte of index
 -                                buf, static_cast<uint32_t>(len), transferred, 0);
+-                    } while (sts != RS2_USB_STATUS_SUCCESS && retries++ < 5);
 +                                buf, static_cast<uint32_t>(len), transferred, UVC_REQUEST_TIMEOUT);
-                     } while (sts != RS2_USB_STATUS_SUCCESS && retries++ < 5);
++                    } while( sts != RS2_USB_STATUS_SUCCESS && sts != RS2_USB_STATUS_TIMEOUT && sts != RS2_USB_STATUS_NO_DEVICE
++                             && retries++ < 5 );  // a camera that stopped answering would block here 6 x UVC_REQUEST_TIMEOUT
                  }
              }, [this](){ return !_messenger; });
+ 
+diff --git a/src/uvc/uvc-streamer.cpp b/src/uvc/uvc-streamer.cpp
+index 5fdb71fc0..5137de8c2 100644
+--- a/src/uvc/uvc-streamer.cpp
++++ b/src/uvc/uvc-streamer.cpp
+@@ -211,7 +211,16 @@ namespace librealsense
+         void uvc_streamer::flush()
+         {
+             if(_running)
+-                stop();
++            {
++                try
++                {
++                    stop();
++                }
++                catch( const std::exception & e )
++                {
++                    LOG_ERROR( "uvc streamer failed to stop: " << e.what() );
++                }
++            }
+ 
+             // synchronized so do not destroy shared pointers while it's still being running
+             {
 diff --git a/third-party/glfw/CMakeLists.txt b/third-party/glfw/CMakeLists.txt
 index 5d94254d8..19dc6d84a 100644
 --- a/third-party/glfw/CMakeLists.txt
@@ -756,6 +1258,108 @@ index bbe96c420..f8b99cb16 100644
      for (GLint i = 0; i < num_extensions; i++)
      {
          const char* extension = (const char*)glGetStringi(GL_EXTENSIONS, i);
+diff --git a/third-party/rsutils/include/rsutils/concurrency/concurrency.h b/third-party/rsutils/include/rsutils/concurrency/concurrency.h
+index 16e1bff11..4c9afd49c 100644
+--- a/third-party/rsutils/include/rsutils/concurrency/concurrency.h
++++ b/third-party/rsutils/include/rsutils/concurrency/concurrency.h
+@@ -8,6 +8,8 @@
+ #include <thread>
+ #include <atomic>
+ #include <functional>
++#include <memory>
++#include <exception>
+ #include <cassert>
+ 
+ const int QUEUE_MAX_SIZE = 10;
+@@ -341,26 +343,65 @@ public:
+     }
+ 
+     // Like above, but synchronous: will return only when the action has actually been dispatched.
++    // An exception thrown by the action is rethrown here. Returns without running the action if exit_condition() holds
++    // before it starts, or if the action is dropped (dispatcher stopped, queue full).
+     //
+     template<class T>
+     void invoke_and_wait(T item, std::function<bool()> exit_condition, bool is_blocking = false)
+     {
+-        bool done = false;
+-
+-        //action
+-        auto func = std::move(item);
+-        invoke([&, func](dispatcher::cancellable_timer c)
++        // Shared with the queued action instead of living on this stack, which is gone if we stop waiting first
++        struct invocation
+         {
+-            std::lock_guard<std::mutex> lk(_blocking_invoke_mutex);
+-            func(c);
++            std::mutex m;
++            std::condition_variable cv;
++            bool started = false, finished = false, abandoned = false;
++            std::exception_ptr error;
+ 
+-            done = true;
+-            _blocking_invoke_cv.notify_one();
+-        }, is_blocking);
++            void finish()
++            {
++                {
++                    std::lock_guard< std::mutex > lk( m );
++                    finished = true;
++                }
++                cv.notify_all();
++            }
++        };
++        // Destroyed with the last copy of the queued action, so a dropped action also wakes us
++        struct finisher
++        {
++            std::shared_ptr< invocation > inv;
++            ~finisher() { inv->finish(); }
++        };
++        auto inv = std::make_shared< invocation >();
++        auto fin = std::make_shared< finisher >();
++        fin->inv = inv;
++        invoke( [fin, func = std::move( item )]( dispatcher::cancellable_timer c ) mutable
++        {
++            invocation & inv = *fin->inv;
++            {
++                std::lock_guard< std::mutex > lk( inv.m );
++                if( inv.abandoned )
++                    return;  // the caller is gone, and func may reference its locals
++                inv.started = true;
++            }
++            try
++            {
++                func( c );
++            }
++            catch( ... )
++            {
++                inv.error = std::current_exception();
++            }
++            inv.finish();
++        }, is_blocking );
++        fin.reset();
+ 
+-        //wait
+-        std::unique_lock<std::mutex> lk(_blocking_invoke_mutex);
+-        _blocking_invoke_cv.wait(lk, [&](){ return done || exit_condition(); });
++        std::unique_lock< std::mutex > lk( inv->m );
++        inv->cv.wait( lk, [&]() { return inv->finished || ( ! inv->started && exit_condition() ); } );
++        if( ! inv->finished )
++            inv->abandoned = true;
++        else if( inv->error )
++            std::rethrow_exception( inv->error );
+     }
+ 
+     // Stops the dispatcher. This is not a pause: it will clear out the queue, losing any pending
+@@ -396,9 +437,6 @@ private:
+ 
+     std::mutex _dispatch_mutex;
+ 
+-    std::condition_variable _blocking_invoke_cv;
+-    std::mutex _blocking_invoke_mutex;
+-
+     std::atomic<bool> _is_alive;
+ };
+ 
 diff --git a/third-party/rsutils/include/rsutils/deferred.h b/third-party/rsutils/include/rsutils/deferred.h
 index 959f6870c..26e75431c 100644
 --- a/third-party/rsutils/include/rsutils/deferred.h
@@ -795,6 +1399,36 @@ index 959f6870c..26e75431c 100644
  
      // Cause the deferred call to be invoked NOW (throws if nothing there!)
      void execute() { _deferred(); }
+diff --git a/third-party/rsutils/src/dispatcher.cpp b/third-party/rsutils/src/dispatcher.cpp
+index 289a4c2a8..1b622023c 100644
+--- a/third-party/rsutils/src/dispatcher.cpp
++++ b/third-party/rsutils/src/dispatcher.cpp
+@@ -85,17 +85,19 @@ void dispatcher::stop()
+     // pending
+     _queue.stop();
+ 
+-    // Wait until any dispatched is done...
+-    {
+-        std::lock_guard< std::mutex > lock(_dispatch_mutex);
+-        assert(_queue.empty());
+-    }
+-    // Signal we've stopped so any sleeping dispatched will wake up immediately
++    // Signal we've stopped so any sleeping dispatched will wake up immediately (before waiting for it, or we'd wait
++    // out its whole sleep)
+     {
+         std::lock_guard< std::mutex > lock( _was_stopped_mutex );
+         _was_stopped = true;
+     }
+     _was_stopped_cv.notify_all();
++
++    // Wait until any dispatched is done...
++    {
++        std::lock_guard< std::mutex > lock(_dispatch_mutex);
++        assert(_queue.empty());
++    }
+ }
+ 
+ 
 diff --git a/tools/CMakeLists.txt b/tools/CMakeLists.txt
 index 399578c4f..a5f459c2f 100644
 --- a/tools/CMakeLists.txt
@@ -810,3 +1444,37 @@ index 399578c4f..a5f459c2f 100644
          add_subdirectory(depth-quality)
          add_subdirectory(rosbag-inspector)
          add_subdirectory(benchmark)
+diff --git a/tools/realsense-viewer/realsense-viewer.cpp b/tools/realsense-viewer/realsense-viewer.cpp
+index 2a729c211..e579b4dbf 100644
+--- a/tools/realsense-viewer/realsense-viewer.cpp
++++ b/tools/realsense-viewer/realsense-viewer.cpp
+@@ -664,6 +664,9 @@ int run_viewer( int argc, const char ** argv,
+     if( on_teardown )
+         on_teardown();
+ 
++    // The device loader thread uses the locals below, so it must be done before they go away
++    window.reset();
++
+     // Stopping post processing filter rendering thread
+     viewer_model.ppf.stop();
+ 
+@@ -675,5 +678,19 @@ int run_viewer( int argc, const char ** argv,
+                 sub->stop(viewer_model.not_model);
+         }
+ 
++    // The stops run in the background, and their frame callbacks use the models destroyed when we return
++    for (auto&& device_model : *device_models)
++        for (auto&& sub : device_model->subdevices)
++        {
++            try
++            {
++                sub->wait_for_stop();
++            }
++            catch (const std::exception& e)
++            {
++                std::cerr << "Failed to stop streaming: " << e.what() << std::endl;
++            }
++        }
++
+     return EXIT_SUCCESS;
+ }

@@ -2,6 +2,9 @@
 // Hardware self-test for RealSense D400 cameras on macOS (Apple Silicon).
 // Exercises the code paths used by RealSense Viewer: enumeration, hardware monitor, options,
 // depth / infrared / color streaming, IMU (HID) streaming and repeated sensor power cycles.
+// With --stress it also hammers the paths that used to hang or crash: start/stop cycles, recording toggled while
+// streaming, presets and options changed while streaming, a long run of all sensors, context teardown and a
+// hardware reset.
 
 #include <librealsense2/rs.hpp>
 
@@ -18,7 +21,7 @@
 #include <algorithm>
 
 #include <unistd.h>
-#include <cstdio>
+#include <mach/mach.h>
 
 namespace
 {
@@ -94,12 +97,240 @@ void check_rate( const std::map< std::string, int > & frames, const std::string 
     std::snprintf( buf, sizeof( buf ), "%-8s %5d frames in %.0fs = %6.1f fps (expected ~%d)", stream.c_str(), n, seconds, rate, fps );
     report( rate >= fps * min_ratio, buf );
 }
+
+double seconds_since( std::chrono::steady_clock::time_point t0 )
+{
+    return std::chrono::duration< double >( std::chrono::steady_clock::now() - t0 ).count();
+}
+
+double resident_mb()
+{
+    mach_task_basic_info_data_t info{};
+    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+    task_info( mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&info, &count );
+    return info.resident_size / 1048576.0;
+}
+
+void run_stress( rs2::context & ctx, rs2::device & dev, rs2::sensor & depth_sensor, rs2::sensor & color_sensor,
+                 rs2::sensor & motion_sensor )
+{
+    std::printf( "\nStress tests\n" );
+    auto dp = find_profile( depth_sensor, RS2_STREAM_DEPTH, -1, RS2_FORMAT_Z16, 848, 480, 30 );
+    auto cp = find_profile( color_sensor, RS2_STREAM_COLOR, -1, RS2_FORMAT_RGB8, 1280, 720, 30 );
+
+    // Start/stop cycles: every start must deliver frames and every stop must return promptly
+    {
+        int cycles = 20, without_frames = 0;
+        double slowest_stop = 0;
+        for( int i = 0; i < cycles; ++i )
+        {
+            std::atomic< int > n{ 0 };
+            depth_sensor.open( dp );
+            depth_sensor.start( [&]( rs2::frame ) { n++; } );
+            std::this_thread::sleep_for( std::chrono::milliseconds( 700 ) );
+            auto t0 = std::chrono::steady_clock::now();
+            depth_sensor.stop();
+            depth_sensor.close();
+            slowest_stop = std::max( slowest_stop, seconds_since( t0 ) );
+            without_frames += n == 0;
+        }
+        char buf[200];
+        std::snprintf( buf, sizeof( buf ), "%d depth start/stop cycles (%d without frames, slowest stop %.2f s)", cycles,
+                       without_frames, slowest_stop );
+        report( without_frames == 0 && slowest_stop < 2.0, buf );
+    }
+
+    // Recording toggled while depth and color stream: the recorder swaps the live frame callbacks every time
+    {
+        char dir_template[] = "/tmp/rs-stress-XXXXXX";
+        std::string dir = mkdtemp( dir_template ) ? dir_template : "/tmp";
+        std::atomic< int > depth_frames{ 0 }, color_frames{ 0 };
+        depth_sensor.open( dp );
+        color_sensor.open( cp );
+        depth_sensor.start( [&]( rs2::frame ) { depth_frames++; } );
+        color_sensor.start( [&]( rs2::frame ) { color_frames++; } );
+        int toggles = 30;
+        for( int i = 0; i < toggles; ++i )
+        {
+            std::string file = dir + "/toggle-" + std::to_string( i ) + ".db3";
+            {
+                rs2::recorder rec( file, dev );
+                std::this_thread::sleep_for( std::chrono::milliseconds( 150 + 50 * ( i % 4 ) ) );
+            }
+            std::remove( file.c_str() );
+        }
+        int d0 = depth_frames, c0 = color_frames;
+        std::this_thread::sleep_for( std::chrono::seconds( 2 ) );
+        int d = depth_frames - d0, c = color_frames - c0;
+        depth_sensor.stop();
+        color_sensor.stop();
+        depth_sensor.close();
+        color_sensor.close();
+        rmdir( dir.c_str() );
+        // The recorder registered for notifications, which turns on error polling: it would keep powering this device
+        // object's depth sensor while the pipeline below streams through another one
+        if( depth_sensor.supports( RS2_OPTION_ERROR_POLLING_ENABLED ) )
+            depth_sensor.set_option( RS2_OPTION_ERROR_POLLING_ENABLED, 0 );
+        report( d > 45 && c > 45, std::to_string( toggles ) + " recording start/stops while streaming, streams still alive (depth "
+                                      + std::to_string( d ) + ", color " + std::to_string( c ) + " frames in 2 s)" );
+    }
+
+    // Presets and options changed while all video streams run, as when clicking through the viewer's controls
+    if( depth_sensor.supports( RS2_OPTION_VISUAL_PRESET ) )
+    {
+        std::atomic< int > depth_frames{ 0 }, color_frames{ 0 };
+        depth_sensor.open( dp );
+        color_sensor.open( cp );
+        depth_sensor.start( [&]( rs2::frame ) { depth_frames++; } );
+        color_sensor.start( [&]( rs2::frame ) { color_frames++; } );
+        auto range = depth_sensor.get_option_range( RS2_OPTION_VISUAL_PRESET );
+        float original = depth_sensor.get_option( RS2_OPTION_VISUAL_PRESET );
+        int errors = 0;
+        std::string first_error;
+        auto t0 = std::chrono::steady_clock::now();
+        for( int round = 0; round < 3; ++round )
+            for( float v = range.min; v <= range.max; v += range.step )
+            {
+                try
+                {
+                    depth_sensor.set_option( RS2_OPTION_VISUAL_PRESET, v );
+                    if( depth_sensor.supports( RS2_OPTION_LASER_POWER ) )
+                        depth_sensor.set_option( RS2_OPTION_LASER_POWER, 30.f * ( 1 + ( (int)v % 5 ) ) );
+                    if( color_sensor.supports( RS2_OPTION_EXPOSURE ) )
+                        color_sensor.get_option( RS2_OPTION_EXPOSURE );
+                }
+                catch( const std::exception & e )
+                {
+                    if( errors++ == 0 )
+                        first_error = e.what();
+                }
+            }
+        double took = seconds_since( t0 );
+        depth_sensor.set_option( RS2_OPTION_VISUAL_PRESET, original );
+        int d0 = depth_frames, c0 = color_frames;
+        std::this_thread::sleep_for( std::chrono::seconds( 2 ) );
+        int d = depth_frames - d0, c = color_frames - c0;
+        depth_sensor.stop();
+        color_sensor.stop();
+        depth_sensor.close();
+        color_sensor.close();
+        char buf[300];
+        std::snprintf( buf, sizeof( buf ), "presets/options x3 while streaming in %.1f s (%d errors%s%s), then depth %d, color %d frames in 2 s",
+                       took, errors, errors ? ": " : "", first_error.c_str(), d, c );
+        report( errors == 0 && d > 45 && c > 45, buf );
+    }
+
+    // Long run of every sensor at once: steady frame rates and no memory growth
+    {
+        double run = 60;
+        rs2::pipeline pipe( ctx );
+        rs2::config cfg;
+        cfg.enable_device( info( dev, RS2_CAMERA_INFO_SERIAL_NUMBER ) );
+        cfg.enable_stream( RS2_STREAM_DEPTH, 848, 480, RS2_FORMAT_Z16, 30 );
+        cfg.enable_stream( RS2_STREAM_INFRARED, 1, 848, 480, RS2_FORMAT_Y8, 30 );
+        cfg.enable_stream( RS2_STREAM_COLOR, 1280, 720, RS2_FORMAT_RGB8, 30 );
+        if( motion_sensor )
+        {
+            cfg.enable_stream( RS2_STREAM_ACCEL );
+            cfg.enable_stream( RS2_STREAM_GYRO );
+        }
+        counter c;
+        pipe.start( cfg, [&]( rs2::frame f ) {
+            if( auto fs = f.as< rs2::frameset >() )
+                for( auto && sub : fs )
+                    c.add( sub );
+            else
+                c.add( f );
+        } );
+        std::this_thread::sleep_for( std::chrono::seconds( 10 ) );  // let allocations settle before measuring
+        double mb0 = resident_mb();
+        std::map< std::string, int > f0;
+        {
+            std::lock_guard< std::mutex > l( c.m );
+            f0 = c.frames;
+        }
+        std::this_thread::sleep_for( std::chrono::duration< double >( run ) );
+        std::map< std::string, int > frames;
+        {
+            std::lock_guard< std::mutex > l( c.m );
+            for( auto & kv : c.frames )
+                frames[kv.first] = kv.second - f0[kv.first];
+        }
+        double mb1 = resident_mb();
+        pipe.stop();
+        std::printf( "  all sensors for %.0f s:\n", run );
+        check_rate( frames, "Depth", run, 30, 0.9 );
+        check_rate( frames, "Infrared 1", run, 30, 0.9 );
+        check_rate( frames, "Color", run, 30, 0.9 );
+        if( motion_sensor )
+            report( frames["Accel"] > run * 50 && frames["Gyro"] > run * 100,
+                    "IMU over the whole run (accel " + std::to_string( frames["Accel"] ) + ", gyro " + std::to_string( frames["Gyro"] ) + ")" );
+        char buf[200];
+        std::snprintf( buf, sizeof( buf ), "memory over the run %.1f -> %.1f MB", mb0, mb1 );
+        report( mb1 - mb0 < 50, buf );
+    }
+
+    // Context teardown used to wait out the device watcher's 2 s poll
+    {
+        auto t0 = std::chrono::steady_clock::now();
+        {
+            rs2::context c2;
+            c2.query_devices();
+        }
+        char buf[100];
+        std::snprintf( buf, sizeof( buf ), "context create, query and destroy in %.2f s", seconds_since( t0 ) );
+        report( seconds_since( t0 ) < 1.5, buf );
+    }
+
+    // Hardware reset: the camera drops off USB and comes back, and must stream again
+    {
+        std::string serial = info( dev, RS2_CAMERA_INFO_SERIAL_NUMBER );
+        dev.hardware_reset();
+        auto t0 = std::chrono::steady_clock::now();
+        bool gone = false;
+        rs2::device again;
+        while( seconds_since( t0 ) < 20 && ! again )
+        {
+            std::this_thread::sleep_for( std::chrono::milliseconds( 500 ) );
+            rs2::device found;
+            try
+            {
+                for( auto && d : ctx.query_devices() )
+                    if( info( d, RS2_CAMERA_INFO_SERIAL_NUMBER ) == serial )
+                        found = d;
+            }
+            catch( const rs2::error & )
+            {
+                // still listed while it drops off USB, so creating it fails
+            }
+            gone = gone || ! found;
+            if( gone && found )
+                again = found;
+        }
+        report( (bool)again, "hardware reset: camera back after " + std::to_string( (int)seconds_since( t0 ) ) + " s" );
+        if( again )
+        {
+            rs2::sensor ds;
+            for( auto && s : again.query_sensors() )
+                if( s.is< rs2::depth_sensor >() )
+                    ds = s;
+            auto p = find_profile( ds, RS2_STREAM_DEPTH, -1, RS2_FORMAT_Z16, 848, 480, 30 );
+            check_rate( stream_sensor( ds, { p }, 3.0 ), "Depth", 3.0, 30, 0.8 );
+        }
+    }
+}
 }  // namespace
 
 int main( int argc, char ** argv )
 try
 {
-    double seconds = argc > 1 ? std::atof( argv[1] ) : 5.0;
+    bool stress = false;
+    double seconds = 5.0;
+    for( int i = 1; i < argc; ++i )
+        if( std::string( argv[i] ) == "--stress" )
+            stress = true;
+        else
+            seconds = std::atof( argv[i] );
     std::printf( "RealSense macOS self-test (librealsense %s, euid=%d)\n", RS2_API_FULL_VERSION_STR, (int)geteuid() );
     if( geteuid() != 0 )
         std::printf( "WARNING: not running as root - macOS needs administrator privileges for USB camera access\n" );
@@ -373,6 +604,9 @@ try
         depth_sensor.close();
         report( ok && depth_alive, "start/stop cycles of color+IMU while depth keeps streaming (" + details.substr( 1 ) + ")" );
     }
+
+    if( stress && depth_sensor && color_sensor )
+        run_stress( ctx, dev, depth_sensor, color_sensor, motion_sensor );
 
     std::printf( "\n%s: %d failure(s)\n", g_failures ? "FAILED" : "PASSED", g_failures );
     return g_failures ? 1 : 0;

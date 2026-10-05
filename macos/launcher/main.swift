@@ -16,6 +16,7 @@ let appName = bundle.object(forInfoDictionaryKey: "CFBundleName") as? String ?? 
 let targetName = bundle.object(forInfoDictionaryKey: "RSLaunchTarget") as? String ?? "realsense-viewer"
 let target = macosDir.appendingPathComponent(targetName).path
 let releaseTool = macosDir.appendingPathComponent("rs-macos-release").path
+let handbackTool = macosDir.appendingPathComponent("rs-macos-handback").path
 let passthroughArgs = Array(CommandLine.arguments.dropFirst()).filter { !$0.hasPrefix("-psn_") }
 
 // Already privileged (e.g. started with sudo from Terminal): just become the tool.
@@ -54,9 +55,7 @@ final class Launcher: NSObject, NSApplicationDelegate {
             \(shellQuote(target)) \(args) >/dev/null 2>&1
             status=$?
             \(shellQuote(releaseTool)) >/dev/null 2>&1
-            for f in "$HOME/.realsense-config.json" "$HOME/Documents"; do
-                [ -e "$f" ] && find "$f" -xdev -maxdepth 3 -user 0 -newer \(shellQuote(stamp)) -exec chown \(uid):\(gid) {} + 2>/dev/null
-            done
+            \(shellQuote(handbackTool)) \(uid) \(gid) \(shellQuote(stamp)) "$HOME/.realsense-config.json" "$HOME/Documents" 2>/dev/null
             exit $status
             """
         let source = "do shell script \(appleScriptQuote(script)) with administrator privileges with prompt "

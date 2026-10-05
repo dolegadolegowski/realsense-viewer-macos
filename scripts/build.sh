@@ -48,7 +48,7 @@ cmake -S "$SRC" -B "$BUILD" -G "Unix Makefiles" \
 
 cmake --build "$BUILD" -j "$JOBS"
 
-# macOS helpers: hardware self-test and the tool that hands cameras back to macOS
+# macOS helpers: hardware self-test, and the tools that hand cameras and files back after a root run
 OUT="$BUILD/$BUILD_TYPE"
 clang++ -std=c++14 -O2 -arch arm64 -mmacosx-version-min="$DEPLOYMENT_TARGET" $PREFIX_MAP -I"$SRC/include" \
     "$ROOT/tools/selftest/rs-macos-selftest.cpp" -L"$OUT" -lrealsense2 -Wl,-rpath,@executable_path \
@@ -56,6 +56,8 @@ clang++ -std=c++14 -O2 -arch arm64 -mmacosx-version-min="$DEPLOYMENT_TARGET" $PR
 clang -O2 -Wall -arch arm64 -mmacosx-version-min="$DEPLOYMENT_TARGET" $PREFIX_MAP \
     "$ROOT/tools/release/rs-macos-release.c" -framework IOKit -framework CoreFoundation \
     -o "$OUT/rs-macos-release"
+clang -O2 -Wall -arch arm64 -mmacosx-version-min="$DEPLOYMENT_TARGET" $PREFIX_MAP \
+    "$ROOT/tools/release/rs-macos-handback.c" -o "$OUT/rs-macos-handback"
 
 echo
 echo "Build finished: $OUT"

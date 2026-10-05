@@ -44,6 +44,10 @@ directly over USB‑C (USB 3.2):
   presets (~350 ms each), parallel access to all sensors, depth + 2×IR at 30 fps, RGB 1280×720 at 30 fps,
   accelerometer + gyroscope at 400 Hz, all sensors at once, recording to `.db3` and playback, repeated
   start/stop of RGB/IMU while depth streams;
+* `rs-macos-selftest --stress` — all checks pass: 20 depth start/stop cycles (stop in 0.06 s), 30 recording
+  start/stops while depth + RGB stream, all presets ×3 with laser power changes while streaming, every sensor for
+  60 s (depth / IR / RGB at 30.0 fps, IMU at 100/200 Hz, no memory growth), context teardown in < 0.01 s, and a
+  hardware reset after which the camera streams again;
 * after quitting, the camera is handed back to macOS and works as a webcam again.
 
 Not tested on purpose: flashing firmware and writing calibration to the camera.
@@ -128,8 +132,34 @@ All changes are in [`patches/0001-macos-apple-silicon-support.patch`](patches/00
 * **Clean shutdown on SIGINT/SIGTERM**, so devices are stopped and released when the app is quit from outside.
 * libusb error names in transfer warnings (the logs printed an unrelated `errno`).
 
+Hangs and crashes found by a stability review (static analysis, ASan/UBSan/TSan builds, soak tests) and fixed:
+
+* **Device command queue** (`rsutils` dispatcher, which serialises every USB command of a device): a command that
+  threw (a failed stream start, an option the camera rejected) left its caller waiting forever, which froze the
+  viewer. A caller that gave up early let the command write into its finished stack frame, and several waiting
+  threads could lose their wake‑ups. Errors now reach the caller, dropped commands release it, and stopping a
+  dispatcher wakes sleeping commands (every context teardown and app exit used to wait ~2 s).
+* **USB requests** whose cancelled transfer completes late keep their buffer until libusb is done with it
+  (use‑after‑free); a failed interface claim releases the handle and the interfaces already claimed (the
+  sensor could not start again until re‑plugged); submit errors report libusb's status instead of a stale
+  `errno`; probe/commit no longer retries a timeout 6× (a hung camera blocked *Start* for 30 s).
+* **IMU start and firmware update** fail with an error instead of crashing when the HID/DFU interface can't be
+  opened; IMU samples no longer copy 38 bytes out of a 12‑byte value.
+* **Recording toggled while streaming** — frame callbacks are swapped atomically and the recorder's wrapper
+  checks that the recorder is still alive (segfault).
+* **Quitting the viewer while streaming or during the splash screen** waits for the background sensor stops
+  and the device loader before the models they use are destroyed (use‑after‑free).
+* **NEON point cloud / align** (always used on Apple Silicon) fall back to the scalar code for frame sizes their
+  vector loops can't handle (heap overflow on such recordings); **spatial filter hole filling** read one pixel
+  past every row; the viewer's post‑processing queue map is locked against the sensor threads.
+* **Running as root safely** — files are handed back to you only if root created them during the session, through
+  descriptors that don't follow links (a planted symlink or hard link could make root give away a system file),
+  and the log file named in the user‑writable settings is opened the same way.
+
 macOS‑specific additions in this repository: the app launcher (`macos/launcher`), `rs-macos-release`
-(re‑enumerates the camera to hand it back to macOS) and `rs-macos-selftest`.
+(re‑enumerates the camera to hand it back to macOS), `rs-macos-handback` (returns ownership of the files the
+viewer created) and `rs-macos-selftest` (`--stress` adds start/stop cycles, recording toggled while streaming,
+presets changed while streaming, a long run of every sensor and a hardware reset).
 
 ## Known limitations
 

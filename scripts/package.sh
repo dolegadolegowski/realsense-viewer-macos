@@ -67,6 +67,7 @@ make_app() {
     cp "$WORK/launcher" "$app/Contents/MacOS/$name"
     cp "$OUT/$target" "$app/Contents/MacOS/$target"
     cp "$OUT/rs-macos-release" "$app/Contents/MacOS/rs-macos-release"
+    cp "$OUT/rs-macos-handback" "$app/Contents/MacOS/rs-macos-handback"
     relink "$app/Contents/MacOS/$target" "@executable_path/../Frameworks"
     copy_libs "$app/Contents/Frameworks"
     cp "$WORK/AppIcon.icns" "$app/Contents/Resources/AppIcon.icns"
