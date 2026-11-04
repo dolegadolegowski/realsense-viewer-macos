@@ -177,6 +177,118 @@ daemon after a change: `sudo launchctl kickstart -k system/io.github.dolegadoleg
 * Non‑RealSense webcams: the root path of the viewer also lists third‑party UVC webcams; through camera access
   they are not shown, because the daemon never captures devices other than RealSense cameras.
 
+## Deploying to many Macs
+
+`deploy-macs.sh` installs or updates the apps **and** camera access on many Macs at once over SSH. It runs on your
+own Mac as your normal user (no sudo). For every target it logs in over SSH as an administrator account, and there,
+with `sudo`, `remote-install.sh` downloads the release DMG from GitHub, checks it and installs it. Afterwards every
+user of those Macs starts RealSense Viewer from *Launchpad* or *Applications* without a password.
+
+**Prerequisites on every target Mac**
+
+* Apple Silicon, macOS 27 or newer, internet access to `github.com` (or a DMG copied there, see `--dmg`);
+* an administrator account that may log in over SSH: *System Settings → General → Sharing → Remote Login* on
+  (*Allow access for* that account);
+* on your Mac: the targets' SSH host keys accepted once (`ssh admin@mac-01.local true`), ideally an SSH key
+  (`ssh-copy-id admin@mac-01.local`) so that only the sudo password is asked for.
+
+**One command** (paste into Terminal on your Mac; replace `admin` and the host names). It downloads the deployment
+scripts of this release (`rs-deploy-v2.58.4-macos.3.tar.gz`, a release asset next to the DMG) into a new private
+temporary folder, checks their SHA-256 and runs them:
+
+```bash
+d="$(mktemp -d)" && curl -fsSL --proto '=https' --proto-redir '=https' -o "$d/rs-deploy.tar.gz" https://github.com/dolegadolegowski/realsense-viewer-macos/releases/download/v2.58.4-macos.3/rs-deploy-v2.58.4-macos.3.tar.gz && echo "be4370814c7827fe2733ad049d144d65244da3510c747b908acd70ea437c4db8  $d/rs-deploy.tar.gz" | shasum -a 256 -c - && tar -xzf "$d/rs-deploy.tar.gz" -C "$d" && "$d/rs-deploy/deploy-macs.sh" --ask-pass -l admin mac-01.local mac-02.local
+```
+
+`--ask-pass` asks for the administrator's sudo password once and uses it on every Mac; without it, `sudo` asks on each
+Mac in turn. If the first Mac rejects the password, the others are skipped, so a typo is not tried everywhere. At
+the end a summary shows `OK`, `FAILED` or `SKIPPED` per Mac (exit status 1 unless all are OK); the full output of
+each Mac is in the log folder it prints.
+
+More examples (`deploy-macs.sh` is `"$d/rs-deploy/deploy-macs.sh"` in the same Terminal window as the command
+above, or `scripts/deploy-macs.sh` in a clone of this repository):
+
+```bash
+# hosts from a file: one [user@]host per line, "#" comments; 4 Macs at a time (needs SSH keys)
+deploy-macs.sh --ask-pass -j 4 -l admin -f lab-macs.txt
+# also install the command line tools to "/Applications/RealSense Tools"
+deploy-macs.sh --ask-pass --tools -l admin -f lab-macs.txt
+# only the apps, camera access unchanged
+deploy-macs.sh --ask-pass --apps-only -l admin -f lab-macs.txt
+# remove camera access; with --remove-apps also the apps and the tools
+deploy-macs.sh --ask-pass --uninstall --remove-apps -l admin -f lab-macs.txt
+# the password from the login keychain instead of typing it (store it once with:
+#   security add-generic-password -s rs-deploy -a admin -w     which asks for it)
+security find-generic-password -s rs-deploy -w | deploy-macs.sh --ask-pass -l admin -f lab-macs.txt
+```
+
+Other options: `--ssh-opt <opt>` (passed as `ssh -o <opt>`, e.g. `Port=2222`), `--tag <tag> --sha256 <hex>` (another
+release), `--dmg <path on the targets>` (e.g. for Macs that reach the internet only through an HTTP proxy: the
+download runs as root through `sudo`, which does not use the macOS proxy settings), `--allow-downgrade`,
+`--log-dir <dir>` (a new private folder is created inside it); `deploy-macs.sh --help` lists all. On a single Mac the
+same script also works by hand: `sudo bash remote-install.sh [--tools] [--apps-only]` or
+`sudo bash remote-install.sh --uninstall [--remove-apps]`.
+
+**What happens on each target:** the DMG of the pinned release is downloaded to a root-only temporary folder and its
+SHA-256 is checked before anything is used; it is attached read-only and invisibly; the code signatures and bundle IDs
+of both apps are checked; each app is copied into a new root-only folder inside `/Applications`, made `root:wheel`,
+stripped of ACLs and quarantine, made read-only for others, checked again and only then renamed into place, replacing
+the old version (with `--tools`, or when `/Applications/RealSense Tools` already exists, the same for the tools); then
+the **installed** app's `install-camera-access.sh` installs or updates the `realsense-usbd` LaunchDaemon (see
+[Camera access](#camera-access-no-password)). The user logged in at the screen gets the macOS notification
+*"Background Items Added"*. If someone is using a RealSense program during an update, their camera stops and they
+have to restart the app (the script warns). Running it again updates; a Mac whose camera access is newer than the
+release is left unchanged and reported as `FAILED` (unless `--allow-downgrade`).
+
+**Interrupted runs:** once a Mac has started, it finishes (or rolls back) on its own even if the SSH connection drops
+or you press Ctrl-C (`--ask-pass` mode); camera access is never left half-installed. Its output after the drop is lost:
+run the same command again to see the state of every Mac (re-running is safe). If a Mac reports a stale lock (only
+after a crash or `kill -9`), the message names the `sudo rm -rf …` command that removes it; a restart also clears it.
+
+**App Management:** if a Mac reports *Operation not permitted* while replacing or removing an app in
+`/Applications`, macOS's *App Management* protection blocked the SSH session. Allow it once on that Mac in *System
+Settings → Privacy & Security → App Management* (the entry `sshd-keygen-wrapper`), or delete the old app in the
+Finder, and run the command again.
+
+**Security notes**
+
+* The release is pinned: tag `v2.58.4-macos.3`, asset `RealSense-Viewer-2.58.4-macOS-arm64.dmg`, SHA-256
+  `2aed32042f8ded5c4a66a9a0c64b356f22579fe98db3af0e3493c680b8020471` (in both scripts). A DMG with another hash is
+  never attached, also with `--dmg`. Downloads use https only (`curl --proto =https --proto-redir =https --tlsv1.2`,
+  without reading any `.curlrc`).
+* The deployment scripts are pinned too: the one-line command checks the SHA-256 of `rs-deploy-v2.58.4-macos.3.tar.gz`
+  before extracting it into a new folder only you can write to. The archive is reproducible:
+  `scripts/deploy/make-bundle.sh` rebuilds it byte for byte from `scripts/deploy-macs.sh` and
+  `scripts/deploy/remote-install.sh` and prints its hash.
+* The sudo password goes to `sudo -S` through the SSH connection's standard input only: never on a command line (so
+  not in `ps` or in a shell history), never in a file or a log. The remote script itself travels as an argument of
+  `bash -c` and starts by closing its standard input, so nothing else can read a password that sudo did not need.
+* On a target, root reads nothing that another user could change: the DMG and its mount point are in a root-only
+  folder, and the copies are prepared in a root-only folder until they are final, so no other user can open, change
+  or add an ACL to any file of them; the camera access installer then applies its own checks (trust rule,
+  allowlist, daemon signature).
+* `--dry-run --root <dir>` is a test mode for `scripts/test-deploy.sh` only (it needs that script's fake `sudo`).
+
+`scripts/test-deploy.sh` tests both scripts and the one-line command without root, SSH or network (dry runs into a
+temporary folder, a fake `ssh`, `sudo` and `curl`). Maintainers: attach `dist/rs-deploy-<tag>.tar.gz` from
+`scripts/deploy/make-bundle.sh` to the release next to the DMG; the test fails when the hash in this README no
+longer matches the scripts.
+
+> 🇵🇱 **Po polsku:** `deploy-macs.sh` instaluje lub aktualizuje RealSense Viewer, Depth Quality Tool i dostęp do
+> kamery (*realsense-usbd*) na wielu Macach naraz przez SSH. Uruchamiasz go na swoim Macu jako zwykły użytkownik
+> (bez sudo); na każdym komputerze loguje się przez SSH na konto administratora, pobiera z GitHuba DMG tego wydania
+> (przypięty tag i skrót SHA‑256, tylko https), sprawdza podpisy, kopiuje aplikacje do */Applications* i instaluje
+> dostęp do kamery — potem każdy użytkownik uruchamia Viewer z Launchpada/Aplikacji bez hasła.
+> Wymagania na każdym Macu: Apple Silicon, macOS 27+, dostęp do github.com, konto administratora z włączonym
+> *Ustawienia systemowe → Ogólne → Udostępnianie → Logowanie zdalne*. Polecenie do Terminala na Twoim Macu (podmień
+> konto `admin` i nazwy komputerów; pobiera skrypty tego wydania do nowego prywatnego folderu i sprawdza ich SHA‑256):
+> `d="$(mktemp -d)" && curl -fsSL --proto '=https' --proto-redir '=https' -o "$d/rs-deploy.tar.gz" https://github.com/dolegadolegowski/realsense-viewer-macos/releases/download/v2.58.4-macos.3/rs-deploy-v2.58.4-macos.3.tar.gz && echo "be4370814c7827fe2733ad049d144d65244da3510c747b908acd70ea437c4db8  $d/rs-deploy.tar.gz" | shasum -a 256 -c - && tar -xzf "$d/rs-deploy.tar.gz" -C "$d" && "$d/rs-deploy/deploy-macs.sh" --ask-pass -l admin mac-01.local mac-02.local`
+> `--ask-pass` pyta o hasło sudo raz i przekazuje je tylko przez standardowe wejście połączenia SSH (nigdy w
+> wierszu poleceń ani w pliku); jeśli pierwszy Mac odrzuci hasło, pozostałe są pomijane. `-f plik.txt` czyta listę
+> komputerów (jeden na linię), `--tools` dodaje narzędzia `rs-*`, `--uninstall --remove-apps` usuwa wszystko. Na
+> końcu jest podsumowanie OK/FAILED/SKIPPED dla każdego Maca. Zerwane połączenie nie przerywa instalacji na Macu,
+> który już zaczął — wystarczy uruchomić polecenie ponownie, żeby zobaczyć stan.
+
 ## Command line tools
 
 `RealSense Tools/` in the DMG contains `rs-enumerate-devices`, `rs-fw-update`, `rs-data-collect`,
