@@ -120,10 +120,17 @@ namespace
         return t;
     }
 
-    std::string temp_base()   // $TMPDIR (per-user on macOS), else /private/tmp
+    // $TMPDIR (per-user on macOS), else /private/tmp; by its real path, because the config loaders refuse symlinked
+    // parents and macOS's $TMPDIR is below the /var symlink
+    std::string temp_base()
     {
         const char * t = getenv( "TMPDIR" );
         std::string b = t && *t ? t : "/private/tmp";
+        if( char * r = realpath( b.c_str(), nullptr ) )
+        {
+            b = r;
+            free( r );
+        }
         while( b.size() > 1 && b.back() == '/' )
             b.pop_back();
         return b;
