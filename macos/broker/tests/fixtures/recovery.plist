@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Devices</key>
+	<array>
+		<dict>
+			<key>ActiveConfig</key>
+			<integer>0</integer>
+			<key>DriversAttached</key>
+			<false/>
+			<key>RegistryID</key>
+			<integer>4294971136</integer>
+			<key>dd</key>
+			<data>
+			EgEQAgAAAAmGgNsKEFABAgMB
+			</data>
+			<key>ifs</key>
+			<array>
+				<dict>
+					<key>alts</key>
+					<array>
+						<dict>
+							<key>d</key>
+							<data>
+							CQQAAAD+AQIA
+							</data>
+							<key>x</key>
+							<data>
+							CSEP/wAABBAB
+							</data>
+						</dict>
+					</array>
+					<key>cfg</key>
+					<integer>0</integer>
+					<key>eps</key>
+					<data>
+					</data>
+				</dict>
+				<dict>
+					<key>alts</key>
+					<array>
+						<dict>
+							<key>d</key>
+							<data>
+							CQQBAAL/AAAA
+							</data>
+							<key>x</key>
+							<data>
+							</data>
+						</dict>
+					</array>
+					<key>cfg</key>
+					<integer>0</integer>
+					<key>eps</key>
+					<data>
+					BwWBAgACAAcFAQIAAgA=
+					</data>
+				</dict>
+			</array>
+			<key>path</key>
+			<string>1-1-2</string>
+		</dict>
+	</array>
+</dict>
+</plist>

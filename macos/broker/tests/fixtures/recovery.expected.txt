@@ -1,0 +1,10 @@
+info id=1-1-2 vid=8086 pid=0adb mi=1 cls=255 uid=1-1-2 spec=0210
+device 1-1-2
+  intf 0 cls=254 sub=1 assoc=[]
+  intf 1 cls=255 sub=0 assoc=[]
+    ep 81 type=2 dir=80 intf=1
+    ep 01 type=2 dir=00 intf=1
+  desc type=01 len=18 12011002000000098680db0a105001020301
+  desc type=04 len=9 0904000000fe010200
+  desc type=21 len=9 09210fff0000041001
+  desc type=04 len=9 0904010002ff000000

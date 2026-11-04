@@ -1,0 +1,1829 @@
+diff --git a/src/libusb/CMakeLists.txt b/src/libusb/CMakeLists.txt
+index f97c63937..ae267817c 100644
+--- a/src/libusb/CMakeLists.txt
++++ b/src/libusb/CMakeLists.txt
+@@ -23,3 +23,20 @@ target_sources(${LRS_TARGET}
+ 
+         "${CMAKE_CURRENT_LIST_DIR}/libusb.h"
+ )
++
++if(APPLE)
++    target_sources(${LRS_TARGET}
++        PRIVATE
++            "${CMAKE_CURRENT_LIST_DIR}/broker/rs-usb-broker-protocol.h"
++            "${CMAKE_CURRENT_LIST_DIR}/broker/broker-wire.h"
++            "${CMAKE_CURRENT_LIST_DIR}/broker/broker-wire.cpp"
++            "${CMAKE_CURRENT_LIST_DIR}/broker/broker-connection.h"
++            "${CMAKE_CURRENT_LIST_DIR}/broker/broker-connection.cpp"
++            "${CMAKE_CURRENT_LIST_DIR}/broker/device-broker.h"
++            "${CMAKE_CURRENT_LIST_DIR}/broker/device-broker.cpp"
++            "${CMAKE_CURRENT_LIST_DIR}/broker/messenger-broker.h"
++            "${CMAKE_CURRENT_LIST_DIR}/broker/messenger-broker.cpp"
++            "${CMAKE_CURRENT_LIST_DIR}/broker/request-broker.h"
++            "${CMAKE_CURRENT_LIST_DIR}/broker/request-broker.cpp"
++    )
++endif()
+diff --git a/src/libusb/broker/broker-connection.cpp b/src/libusb/broker/broker-connection.cpp
+new file mode 100644
+index 000000000..d325953ab
+--- /dev/null
++++ b/src/libusb/broker/broker-connection.cpp
+@@ -0,0 +1,454 @@
++// License: Apache 2.0. See LICENSE file in root directory.
++// Copyright(c) 2026 RealSense, Inc. All Rights Reserved.
++
++#include "broker-connection.h"
++#include "device-broker.h"
++#include "request-broker.h"
++#include "../interface-libusb.h"
++#include "../handle-libusb.h"
++
++#include <rsutils/easylogging/easyloggingpp.h>
++
++#include <algorithm>
++#include <atomic>
++#include <thread>
++
++namespace librealsense
++{
++    namespace platform
++    {
++        using steady = std::chrono::steady_clock;
++
++        static xpc_endpoint_t test_endpoint = nullptr;
++        static std::atomic< uint32_t > hide_ms{ RSUSB_LOSS_HIDE_MS };
++
++        namespace
++        {
++            struct call_state
++            {
++                dispatch_semaphore_t done = dispatch_semaphore_create( 0 );
++                xpc_ptr reply;
++                ~call_state() { dispatch_release( done ); }
++            };
++
++            std::shared_ptr< call_state > send_with_reply( xpc_connection_t conn, xpc_object_t msg )
++            {
++                auto state = std::make_shared< call_state >();
++                xpc_connection_send_message_with_reply( conn, msg, dispatch_get_global_queue( QOS_CLASS_USER_INITIATED, 0 ),
++                                                        ^( xpc_object_t reply ) {
++                                                            state->reply = xpc_ptr::retain( reply );
++                                                            dispatch_semaphore_signal( state->done );
++                                                        } );
++                return state;
++            }
++
++            bool wait( const std::shared_ptr< call_state > & state, steady::time_point deadline )
++            {
++                auto ns = std::chrono::duration_cast< std::chrono::nanoseconds >( deadline - steady::now() ).count();
++                return dispatch_semaphore_wait( state->done, dispatch_time( DISPATCH_TIME_NOW, ns > 0 ? ns : 0 ) ) == 0;
++            }
++        }
++
++        xpc_ptr broker_message( uint64_t op )
++        {
++            auto msg = xpc_ptr::adopt( xpc_dictionary_create( nullptr, nullptr, 0 ) );
++            xpc_dictionary_set_uint64( msg.get(), RSUSB_KEY_OP, op );
++            return msg;
++        }
++
++        usb_status broker_status_to_rs( const broker_reply & reply )
++        {
++            switch( reply.result )
++            {
++            case broker_reply::ok:
++                return reply.status < INT32_MIN || reply.status > INT32_MAX ? RS2_USB_STATUS_OTHER
++                                                                            : libusb_status_to_rs( int( reply.status ) );
++            case broker_reply::timeout: return RS2_USB_STATUS_TIMEOUT;
++            case broker_reply::invalid: return RS2_USB_STATUS_OTHER;
++            default: return RS2_USB_STATUS_NO_DEVICE;
++            }
++        }
++
++        void usb_broker::use_endpoint_for_testing( xpc_endpoint_t endpoint )
++        {
++            test_endpoint = static_cast< xpc_endpoint_t >( xpc_retain( endpoint ) );
++        }
++
++        void usb_broker::hide_ms_for_testing( uint32_t ms )
++        {
++            hide_ms = ms;
++        }
++
++        std::shared_ptr< usb_broker > usb_broker::instance()
++        {
++            static std::once_flag once;
++            static std::shared_ptr< usb_broker > broker;
++            std::call_once( once, []() {
++                auto b = std::make_shared< usb_broker >();
++                auto conn = b->connect();
++                std::string reason;
++                if( b->hello( conn.connection(), reason ) != hello_ok )
++                {
++                    // the destructor cancels the connection
++                    LOG_INFO( "RealSense USB broker not used (" << reason << "), accessing USB devices in-process" );
++                    return;
++                }
++                std::unique_lock< std::shared_timed_mutex > lock( b->_session_mutex );
++                b->_generation = 1;
++                b->_up = true;
++                b->_routes = std::make_shared< broker_route_table >();
++                broker = b;
++            } );
++            return broker;
++        }
++
++        usb_broker::usb_broker()
++            : _queue( dispatch_queue_create( "librealsense.usb-broker.connection", DISPATCH_QUEUE_SERIAL ) )
++        {
++        }
++
++        usb_broker::~usb_broker()
++        {
++            if( _conn && ! _conn_invalid )
++                xpc_connection_cancel( _conn.connection() );
++            dispatch_release( _queue );
++        }
++
++        xpc_ptr usb_broker::connect()
++        {
++            auto conn = xpc_ptr::adopt( test_endpoint
++                ? xpc_connection_create_from_endpoint( test_endpoint )
++                : xpc_connection_create_mach_service( RSUSB_SERVICE_NAME, _queue, XPC_CONNECTION_MACH_SERVICE_PRIVILEGED ) );
++            xpc_connection_set_target_queue( conn.connection(), _queue );
++            std::unique_lock< std::shared_timed_mutex > lock( _session_mutex );
++            uint64_t id = ++_conn_id;
++            std::weak_ptr< usb_broker > weak = shared_from_this();
++            xpc_connection_set_event_handler( conn.connection(), ^( xpc_object_t event ) {
++                if( auto self = weak.lock() )
++                    self->on_event( id, event );
++            } );
++            xpc_connection_resume( conn.connection() );
++            _conn = conn;
++            _conn_invalid = false;
++            _conn_created = steady::now();
++            return conn;
++        }
++
++        usb_broker::hello_result usb_broker::hello( xpc_connection_t conn, std::string & reason )
++        {
++            auto deadline = steady::now() + std::chrono::milliseconds( RSUSB_HELLO_TIMEOUT_MS );
++            reason = "not reachable: not installed, turned off, or this build is not allowlisted";
++            auto msg = broker_message( RSUSB_OP_HELLO );
++            xpc_dictionary_set_uint64( msg.get(), RSUSB_KEY_VERSION, RSUSB_PROTOCOL_VERSION );
++            // An interrupted connection (daemon idle-exiting or relaunching) is retried; invalid is final
++            for( int retries = 3; ; --retries )
++            {
++                auto state = send_with_reply( conn, msg.get() );
++                if( ! wait( state, deadline ) )
++                    return hello_unreachable;
++                xpc_object_t r = state->reply.get();
++                if( r == XPC_ERROR_CONNECTION_INTERRUPTED && retries > 0 && steady::now() < deadline )
++                {
++                    std::this_thread::sleep_for( std::chrono::milliseconds( 100 ) );
++                    continue;
++                }
++                int64_t st;
++                uint64_t pv, auth;
++                std::string build;
++                if( ! xpc_get_i64( r, RSUSB_KEY_STATUS, st ) || st != RSUSB_ST_SUCCESS
++                    || ! xpc_get_u64( r, RSUSB_KEY_VERSION, pv ) || ! xpc_get_u64( r, RSUSB_KEY_AUTH, auth )
++                    || ! xpc_get_string( r, RSUSB_KEY_BUILD, build ) || build.size() > RSUSB_MAX_BUILD_LEN )
++                    return hello_unreachable;
++                switch( auth )
++                {
++                case RSUSB_AUTH_OK:
++                    if( pv == RSUSB_PROTOCOL_VERSION )
++                    {
++                        LOG_INFO( "Using RealSense USB broker " << build );
++                        return hello_ok;
++                    }
++                    reason = "protocol version";
++                    break;
++                case RSUSB_AUTH_USER: reason = "not the console user"; break;
++                case RSUSB_AUTH_CAMERA_DISABLED: reason = "camera disabled by policy"; break;
++                case RSUSB_AUTH_VERSION: reason = "protocol version"; break;
++                case RSUSB_AUTH_LIMIT: reason = "too many clients"; break;
++                default: return hello_unreachable;
++                }
++                return hello_rejected;
++            }
++        }
++
++        uint64_t usb_broker::ensure_session()
++        {
++            std::lock_guard< std::mutex > connecting( _connect_mutex );
++            xpc_ptr conn;
++            {
++                std::shared_lock< std::shared_timed_mutex > lock( _session_mutex );
++                if( _up )
++                    return _generation;
++                if( ! _conn_invalid )
++                    conn = _conn;
++                else if( steady::now() - _conn_created < std::chrono::seconds( 1 ) )
++                    return 0;
++            }
++            if( ! conn )
++                conn = connect();
++            std::string reason;
++            auto result = hello( conn.connection(), reason );
++            std::unique_lock< std::shared_timed_mutex > lock( _session_mutex );
++            if( result != hello_ok )
++            {
++                LOG_DEBUG( "RealSense USB broker session not restored: " << reason );
++                xpc_connection_cancel( conn.connection() );
++                _conn_invalid = true;
++                return 0;
++            }
++            _up = true;
++            _routes = std::make_shared< broker_route_table >();
++            return ++_generation;
++        }
++
++        void usb_broker::end_session( uint64_t generation, bool cancel )
++        {
++            std::shared_ptr< broker_route_table > routes;
++            {
++                std::unique_lock< std::shared_timed_mutex > lock( _session_mutex );
++                if( ! _up || generation != _generation )
++                    return;
++                _up = false;
++                ++_generation;
++                routes.swap( _routes );
++                if( cancel )
++                {
++                    xpc_connection_cancel( _conn.connection() );
++                    _conn_invalid = true;
++                }
++            }
++            LOG_WARNING( "RealSense USB broker session lost" );
++            {
++                std::lock_guard< std::mutex > lock( _state_mutex );
++                _hide_all_until = steady::now() + std::chrono::milliseconds( hide_ms );
++                for( auto & weak : _devices )
++                    if( auto dev = weak.lock() )
++                        dev->set_dead();
++            }
++            // Every request still in flight completes with NO_DEVICE through its device's callback queue
++            std::lock_guard< std::mutex > lock( routes->mutex );
++            for( auto & route : routes->routes )
++            {
++                uint64_t r = route.first;
++                dispatch_async( route.second->callback_queue(), ^{
++                    usb_request_broker::deliver( routes, r, RSUSB_XS_NO_DEVICE, 0 );
++                } );
++            }
++        }
++
++        void usb_broker::on_event( uint64_t conn_id, xpc_object_t event )
++        {
++            if( xpc_get_type( event ) == XPC_TYPE_ERROR )
++            {
++                uint64_t generation;
++                {
++                    std::unique_lock< std::shared_timed_mutex > lock( _session_mutex );
++                    if( conn_id != _conn_id )
++                        return;
++                    if( event == XPC_ERROR_CONNECTION_INVALID )
++                        _conn_invalid = true;
++                    generation = _generation;
++                }
++                end_session( generation, false );
++                return;
++            }
++
++            uint64_t ev, generation;
++            std::shared_ptr< broker_route_table > routes;
++            {
++                std::shared_lock< std::shared_timed_mutex > lock( _session_mutex );
++                if( conn_id != _conn_id || ! _up )
++                    return;
++                generation = _generation;
++                routes = _routes;
++            }
++            if( ! xpc_get_u64( event, RSUSB_KEY_EVENT, ev ) )
++                return;
++            if( ev == RSUSB_EV_REQ_DONE )
++            {
++                uint64_t r, xs, n;
++                if( ! xpc_get_u64( event, RSUSB_KEY_REQUEST_ID, r ) || ! xpc_get_u64( event, RSUSB_KEY_TRANSFER_STATUS, xs )
++                    || ! xpc_get_u64( event, RSUSB_KEY_TRANSFERRED, n ) )
++                    return;
++                std::lock_guard< std::mutex > lock( routes->mutex );
++                auto it = routes->routes.find( r );
++                if( it != routes->routes.end() )
++                    dispatch_async( it->second->callback_queue(), ^{
++                        usb_request_broker::deliver( routes, r, xs, n );
++                    } );
++            }
++            else if( ev == RSUSB_EV_DEVICE_GONE )
++            {
++                uint64_t tok;
++                if( xpc_get_u64( event, RSUSB_KEY_TOKEN, tok ) )
++                    device_lost( generation, tok );
++            }
++        }
++
++        bool usb_broker::is_current( uint64_t generation ) const
++        {
++            std::shared_lock< std::shared_timed_mutex > lock( _session_mutex );
++            return _up && generation == _generation;
++        }
++
++        std::shared_ptr< broker_route_table > usb_broker::routes( uint64_t generation ) const
++        {
++            std::shared_lock< std::shared_timed_mutex > lock( _session_mutex );
++            return _up && generation == _generation ? _routes : nullptr;
++        }
++
++        broker_reply usb_broker::call( uint64_t generation, xpc_object_t msg, uint32_t timeout_ms, bool end_on_timeout )
++        {
++            std::shared_ptr< call_state > state;
++            {
++                std::shared_lock< std::shared_timed_mutex > lock( _session_mutex );
++                if( ! _up || generation != _generation )
++                    return { broker_reply::failed, {}, 0 };
++                state = send_with_reply( _conn.connection(), msg );
++            }
++            if( ! wait( state, steady::now() + std::chrono::milliseconds( timeout_ms ) ) )
++            {
++                if( end_on_timeout )
++                    end_session( generation, true );
++                return { broker_reply::timeout, {}, 0 };
++            }
++            if( xpc_get_type( state->reply.get() ) == XPC_TYPE_ERROR )
++                return { broker_reply::failed, {}, 0 };
++            int64_t st;
++            if( ! xpc_get_i64( state->reply.get(), RSUSB_KEY_STATUS, st ) )
++                return { broker_reply::invalid, {}, 0 };
++            return { broker_reply::ok, state->reply, st };
++        }
++
++        void usb_broker::send( uint64_t generation, xpc_object_t msg, bool with_reply )
++        {
++            std::shared_lock< std::shared_timed_mutex > lock( _session_mutex );
++            if( ! _up || generation != _generation )
++                return;
++            if( with_reply )
++                xpc_connection_send_message_with_reply( _conn.connection(), msg, dispatch_get_global_queue( QOS_CLASS_UTILITY, 0 ),
++                                                        ^( xpc_object_t ) {} );
++            else
++                xpc_connection_send_message( _conn.connection(), msg );
++        }
++
++        void usb_broker::device_lost( uint64_t generation, uint64_t token )
++        {
++            if( ! is_current( generation ) )
++                return;
++            std::lock_guard< std::mutex > lock( _state_mutex );
++            for( auto & weak : _devices )
++            {
++                auto dev = weak.lock();
++                if( dev && dev->get_generation() == generation && dev->get_token() == token )
++                {
++                    dev->set_dead();
++                    _hidden[dev->get_path()] = steady::now() + std::chrono::milliseconds( hide_ms );
++                }
++            }
++        }
++
++        bool usb_broker::is_hidden( const std::string & path )
++        {
++            std::lock_guard< std::mutex > lock( _state_mutex );
++            auto it = _hidden.find( path );
++            if( it == _hidden.end() )
++                return false;
++            if( steady::now() < it->second )
++                return true;
++            _hidden.erase( it );
++            return false;
++        }
++
++        bool usb_broker::enumerate( uint64_t generation, std::vector< broker_device_snapshot > & devices )
++        {
++            auto reply = call( generation, broker_message( RSUSB_OP_ENUMERATE ).get(), RSUSB_CALL_TIMEOUT_MS, false );
++            if( reply.result != broker_reply::ok || reply.status != RSUSB_ST_SUCCESS )
++                return false;
++            if( parse_enumerate_reply( reply.msg.get(), devices ) )
++                return true;
++            LOG_WARNING( "invalid device list from the RealSense USB broker" );
++            return false;
++        }
++
++        std::vector< usb_device_info > usb_broker::query_devices_info()
++        {
++            std::vector< usb_device_info > rv;
++            std::vector< broker_device_snapshot > devices;
++            auto generation = ensure_session();
++            if( ! generation )
++                return rv;
++            {
++                std::lock_guard< std::mutex > lock( _state_mutex );
++                if( steady::now() < _hide_all_until )
++                    return rv;
++            }
++            if( ! enumerate( generation, devices ) )
++                return rv;
++            for( auto & dev : devices )
++            {
++                if( is_hidden( dev.path ) )
++                    continue;
++                auto & dd = dev.device_desc;
++                for( size_t i = 0; i < dev.interfaces.size(); ++i )
++                {
++                    auto & intf = dev.interfaces[i];
++                    auto & alt = intf.alts[0].desc;
++                    uint16_t mi = 0;   // index within its configuration
++                    for( size_t j = i; j > 0 && dev.interfaces[j - 1].config == intf.config; --j )
++                        ++mi;
++                    // as get_subdevices(): no streaming interfaces, no DFU twin
++                    if( alt[6] == 2 || alt[5] == RS2_USB_CLASS_APPLICATION_SPECIFIC )
++                        continue;
++                    usb_device_info info{};
++                    info.id = dev.path;
++                    info.unique_id = dev.path;
++                    info.conn_spec = usb_spec( dd[2] | dd[3] << 8 );
++                    info.vid = uint16_t( dd[8] | dd[9] << 8 );
++                    info.pid = uint16_t( dd[10] | dd[11] << 8 );
++                    info.mi = mi;
++                    info.cls = usb_class( alt[5] );
++                    rv.push_back( info );
++                }
++            }
++            return rv;
++        }
++
++        rs_usb_device usb_broker::create_usb_device( const usb_device_info & info )
++        {
++            std::vector< broker_device_snapshot > devices;
++            auto generation = ensure_session();
++            if( ! generation || ! enumerate( generation, devices ) )
++                return nullptr;
++            for( auto & dev : devices )
++            {
++                if( dev.path != info.id || is_hidden( dev.path ) )
++                    continue;
++                auto msg = broker_message( RSUSB_OP_LEASE );
++                xpc_dictionary_set_uint64( msg.get(), RSUSB_KEY_TOKEN, dev.token );
++                auto reply = call( generation, msg.get(), RSUSB_CALL_TIMEOUT_MS, true );
++                if( reply.result != broker_reply::ok || reply.status != RSUSB_ST_SUCCESS )
++                {
++                    LOG_WARNING( "RealSense USB broker refused device " << info.id << ": " << reply.status );
++                    return nullptr;
++                }
++                auto rv = std::make_shared< usb_device_broker >( shared_from_this(), dev, info, generation );
++                std::lock_guard< std::mutex > lock( _state_mutex );
++                _devices.erase( std::remove_if( _devices.begin(), _devices.end(),
++                                                []( const std::weak_ptr< usb_device_broker > & d ) { return d.expired(); } ),
++                                _devices.end() );
++                _devices.push_back( rv );
++                return rv;
++            }
++            return nullptr;
++        }
++    }
++}
+diff --git a/src/libusb/broker/broker-connection.h b/src/libusb/broker/broker-connection.h
+new file mode 100644
+index 000000000..59a42413f
+--- /dev/null
++++ b/src/libusb/broker/broker-connection.h
+@@ -0,0 +1,99 @@
++// License: Apache 2.0. See LICENSE file in root directory.
++// Copyright(c) 2026 RealSense, Inc. All Rights Reserved.
++
++#pragma once
++
++#include "broker-wire.h"
++#include "usb/usb-device.h"
++
++#include <dispatch/dispatch.h>
++
++#include <chrono>
++#include <condition_variable>
++#include <map>
++#include <memory>
++#include <mutex>
++#include <shared_mutex>
++#include <string>
++#include <vector>
++
++namespace librealsense
++{
++    namespace platform
++    {
++        class usb_device_broker;
++        class usb_request_broker;
++
++        // Requests by their daemon id, one table per session
++        struct broker_route_table
++        {
++            std::mutex mutex;
++            std::condition_variable idle;   // a request's pin count dropped
++            std::map< uint64_t, usb_request_broker * > routes;
++        };
++
++        struct broker_reply
++        {
++            enum result_t { ok, timeout, failed, invalid };   // failed: stale session or connection error
++            result_t result;
++            xpc_ptr msg;
++            int64_t status;
++        };
++
++        // Connection to the realsense-usbd daemon, chosen once per process by a HELLO; nullptr means in-process libusb
++        class usb_broker : public std::enable_shared_from_this< usb_broker >
++        {
++        public:
++            static std::shared_ptr< usb_broker > instance();
++            // Must be called before the first enumeration
++            static void use_endpoint_for_testing( xpc_endpoint_t endpoint );
++            static void hide_ms_for_testing( uint32_t ms );
++
++            usb_broker();
++            ~usb_broker();
++
++            std::vector< usb_device_info > query_devices_info();
++            rs_usb_device create_usb_device( const usb_device_info & info );
++
++            bool is_current( uint64_t generation ) const;
++            // A missed deadline ends the session when end_on_timeout
++            broker_reply call( uint64_t generation, xpc_object_t msg, uint32_t timeout_ms, bool end_on_timeout );
++            // Fire and forget; a reply, if the op has one, is ignored
++            void send( uint64_t generation, xpc_object_t msg, bool with_reply );
++            std::shared_ptr< broker_route_table > routes( uint64_t generation ) const;
++            void device_lost( uint64_t generation, uint64_t token );
++
++        private:
++            enum hello_result { hello_ok, hello_rejected, hello_unreachable };
++
++            xpc_ptr connect();
++            hello_result hello( xpc_connection_t conn, std::string & reason );
++            uint64_t ensure_session();
++            void end_session( uint64_t generation, bool cancel );
++            void on_event( uint64_t conn_id, xpc_object_t event );
++            bool enumerate( uint64_t generation, std::vector< broker_device_snapshot > & devices );
++            bool is_hidden( const std::string & path );
++
++            dispatch_queue_t _queue;   // connection target queue: events and errors only
++
++            mutable std::shared_timed_mutex _session_mutex;
++            xpc_ptr _conn;
++            uint64_t _conn_id = 0;
++            bool _conn_invalid = false;
++            std::chrono::steady_clock::time_point _conn_created;
++            uint64_t _generation = 0;
++            bool _up = false;
++            std::shared_ptr< broker_route_table > _routes;
++
++            std::mutex _connect_mutex;   // serializes reconnects
++
++            std::mutex _state_mutex;
++            std::vector< std::weak_ptr< usb_device_broker > > _devices;
++            std::map< std::string, std::chrono::steady_clock::time_point > _hidden;
++            std::chrono::steady_clock::time_point _hide_all_until;
++        };
++
++        usb_status broker_status_to_rs( const broker_reply & reply );
++        xpc_ptr broker_message( uint64_t op );
++    }
++}
+diff --git a/src/libusb/broker/broker-wire.cpp b/src/libusb/broker/broker-wire.cpp
+new file mode 100644
+index 000000000..f9f5a472b
+--- /dev/null
++++ b/src/libusb/broker/broker-wire.cpp
+@@ -0,0 +1,141 @@
++// License: Apache 2.0. See LICENSE file in root directory.
++// Copyright(c) 2026 RealSense, Inc. All Rights Reserved.
++
++#include "broker-wire.h"
++
++#include <string.h>
++
++namespace librealsense
++{
++    namespace platform
++    {
++        static xpc_object_t get_typed( xpc_object_t dict, const char * key, xpc_type_t type )
++        {
++            if( ! dict || xpc_get_type( dict ) != XPC_TYPE_DICTIONARY )
++                return nullptr;
++            xpc_object_t v = xpc_dictionary_get_value( dict, key );
++            return v && xpc_get_type( v ) == type ? v : nullptr;
++        }
++
++        bool xpc_get_u64( xpc_object_t dict, const char * key, uint64_t & value )
++        {
++            xpc_object_t v = get_typed( dict, key, XPC_TYPE_UINT64 );
++            if( v )
++                value = xpc_uint64_get_value( v );
++            return v != nullptr;
++        }
++
++        bool xpc_get_i64( xpc_object_t dict, const char * key, int64_t & value )
++        {
++            xpc_object_t v = get_typed( dict, key, XPC_TYPE_INT64 );
++            if( v )
++                value = xpc_int64_get_value( v );
++            return v != nullptr;
++        }
++
++        bool xpc_get_data( xpc_object_t dict, const char * key, std::vector< uint8_t > & value )
++        {
++            xpc_object_t v = get_typed( dict, key, XPC_TYPE_DATA );
++            if( ! v )
++                return false;
++            auto p = static_cast< const uint8_t * >( xpc_data_get_bytes_ptr( v ) );
++            size_t n = xpc_data_get_length( v );
++            value.assign( p, p + ( p ? n : 0 ) );
++            return true;
++        }
++
++        bool xpc_get_array( xpc_object_t dict, const char * key, xpc_object_t & value )
++        {
++            value = get_typed( dict, key, XPC_TYPE_ARRAY );
++            return value != nullptr;
++        }
++
++        bool xpc_get_string( xpc_object_t dict, const char * key, std::string & value )
++        {
++            xpc_object_t v = get_typed( dict, key, XPC_TYPE_STRING );
++            if( v )
++                value.assign( xpc_string_get_string_ptr( v ), xpc_string_get_length( v ) );
++            return v != nullptr;
++        }
++
++        bool xpc_get_shmem( xpc_object_t dict, const char * key, xpc_object_t & value )
++        {
++            value = get_typed( dict, key, XPC_TYPE_SHMEM );
++            return value != nullptr;
++        }
++
++        static bool parse_interface( xpc_object_t dict, uint8_t num_configs, broker_interface & intf )
++        {
++            uint64_t cfg;
++            xpc_object_t alts;
++            if( ! xpc_get_u64( dict, RSUSB_KEY_CONFIG, cfg ) || cfg >= num_configs
++                || ! xpc_get_array( dict, RSUSB_KEY_ALTSETTINGS, alts )
++                || ! xpc_get_data( dict, RSUSB_KEY_ENDPOINTS, intf.endpoints ) )
++                return false;
++            size_t n = xpc_array_get_count( alts );
++            if( n < 1 || n > RSUSB_MAX_ALTSETTINGS )
++                return false;
++            intf.config = uint8_t( cfg );
++            intf.alts.resize( n );
++            for( size_t j = 0; j < n; ++j )
++            {
++                auto & alt = intf.alts[j];
++                xpc_object_t a = xpc_array_get_value( alts, j );
++                if( ! xpc_get_data( a, RSUSB_KEY_INTERFACE_DESC, alt.desc ) || alt.desc.size() != RSUSB_INTERFACE_DESC_LEN
++                    || ! xpc_get_data( a, RSUSB_KEY_EXTRA, alt.extra ) || alt.extra.size() > RSUSB_MAX_EXTRA_LEN )
++                    return false;
++            }
++            // altsetting 0's bNumEndpoints must match the endpoint records the interface is built from
++            size_t eps = intf.endpoints.size();
++            return eps % RSUSB_ENDPOINT_WIRE_LEN == 0 && eps / RSUSB_ENDPOINT_WIRE_LEN <= RSUSB_MAX_ENDPOINTS
++                && eps / RSUSB_ENDPOINT_WIRE_LEN == intf.alts[0].desc[4];
++        }
++
++        static bool parse_device( xpc_object_t dict, broker_device_snapshot & dev )
++        {
++            xpc_object_t ifs;
++            if( ! xpc_get_u64( dict, RSUSB_KEY_TOKEN, dev.token ) || ! dev.token
++                || ! xpc_get_string( dict, RSUSB_KEY_PATH, dev.path ) || dev.path.empty()
++                || dev.path.size() > RSUSB_MAX_PATH_LEN || dev.path.find( '\0' ) != std::string::npos
++                || ! xpc_get_data( dict, RSUSB_KEY_DEVICE_DESC, dev.device_desc )
++                || dev.device_desc.size() != RSUSB_DEVICE_DESC_LEN || ! xpc_get_array( dict, RSUSB_KEY_INTERFACES, ifs ) )
++                return false;
++            uint8_t num_configs = dev.device_desc[17];
++            size_t n = xpc_array_get_count( ifs );
++            if( n > size_t( RSUSB_MAX_INTERFACES ) * num_configs )
++                return false;
++            dev.interfaces.resize( n );
++            size_t per_config = 0;
++            for( size_t i = 0; i < n; ++i )
++            {
++                if( ! parse_interface( xpc_array_get_value( ifs, i ), num_configs, dev.interfaces[i] ) )
++                    return false;
++                // configurations are concatenated in index order
++                if( i && dev.interfaces[i].config < dev.interfaces[i - 1].config )
++                    return false;
++                per_config = i && dev.interfaces[i].config == dev.interfaces[i - 1].config ? per_config + 1 : 1;
++                if( per_config > RSUSB_MAX_INTERFACES )
++                    return false;
++            }
++            return true;
++        }
++
++        bool parse_enumerate_reply( xpc_object_t reply, std::vector< broker_device_snapshot > & devices )
++        {
++            int64_t st;
++            xpc_object_t devs;
++            if( ! xpc_get_i64( reply, RSUSB_KEY_STATUS, st ) || st != RSUSB_ST_SUCCESS
++                || ! xpc_get_array( reply, RSUSB_KEY_DEVICES, devs ) )
++                return false;
++            size_t n = xpc_array_get_count( devs );
++            if( n > RSUSB_MAX_DEVICES )
++                return false;
++            std::vector< broker_device_snapshot > rv( n );
++            for( size_t i = 0; i < n; ++i )
++                if( ! parse_device( xpc_array_get_value( devs, i ), rv[i] ) )
++                    return false;
++            devices = std::move( rv );
++            return true;
++        }
++    }
++}
+diff --git a/src/libusb/broker/broker-wire.h b/src/libusb/broker/broker-wire.h
+new file mode 100644
+index 000000000..4410bdb45
+--- /dev/null
++++ b/src/libusb/broker/broker-wire.h
+@@ -0,0 +1,71 @@
++// License: Apache 2.0. See LICENSE file in root directory.
++// Copyright(c) 2026 RealSense, Inc. All Rights Reserved.
++
++#pragma once
++
++#include "rs-usb-broker-protocol.h"
++
++#include <xpc/xpc.h>
++
++#include <stdint.h>
++#include <string>
++#include <vector>
++
++// XPC helpers and reply validation of the USB broker client. No librealsense dependencies, so the daemon's fuzzer can
++// compile it on its own.
++namespace librealsense
++{
++    namespace platform
++    {
++        class xpc_ptr
++        {
++        public:
++            xpc_ptr() = default;
++            static xpc_ptr adopt( xpc_object_t o ) { xpc_ptr p; p._o = o; return p; }
++            static xpc_ptr retain( xpc_object_t o ) { return adopt( o ? xpc_retain( o ) : nullptr ); }
++            xpc_ptr( const xpc_ptr & other ) : _o( other._o ? xpc_retain( other._o ) : nullptr ) {}
++            xpc_ptr( xpc_ptr && other ) : _o( other._o ) { other._o = nullptr; }
++            xpc_ptr & operator=( xpc_ptr other ) { std::swap( _o, other._o ); return *this; }
++            ~xpc_ptr() { if( _o ) xpc_release( _o ); }
++
++            xpc_object_t get() const { return _o; }
++            xpc_connection_t connection() const { return static_cast< xpc_connection_t >( _o ); }
++            explicit operator bool() const { return _o != nullptr; }
++
++        private:
++            xpc_object_t _o = nullptr;
++        };
++
++        // Typed getters: false for a missing key or a value of another type
++        bool xpc_get_u64( xpc_object_t dict, const char * key, uint64_t & value );
++        bool xpc_get_i64( xpc_object_t dict, const char * key, int64_t & value );
++        bool xpc_get_data( xpc_object_t dict, const char * key, std::vector< uint8_t > & value );
++        bool xpc_get_array( xpc_object_t dict, const char * key, xpc_object_t & value );
++        bool xpc_get_string( xpc_object_t dict, const char * key, std::string & value );
++        bool xpc_get_shmem( xpc_object_t dict, const char * key, xpc_object_t & value );
++
++        struct broker_altsetting
++        {
++            std::vector< uint8_t > desc;   // RSUSB_INTERFACE_DESC_LEN bytes
++            std::vector< uint8_t > extra;
++        };
++
++        struct broker_interface
++        {
++            uint8_t config;
++            std::vector< broker_altsetting > alts;
++            std::vector< uint8_t > endpoints;   // altsetting 0, RSUSB_ENDPOINT_WIRE_LEN bytes each
++        };
++
++        struct broker_device_snapshot
++        {
++            uint64_t token;
++            std::string path;
++            std::vector< uint8_t > device_desc;   // RSUSB_DEVICE_DESC_LEN bytes
++            std::vector< broker_interface > interfaces;
++        };
++
++        // ENUMERATE reply -> snapshots; false if any key, type, length or count violates the protocol header
++        bool parse_enumerate_reply( xpc_object_t reply, std::vector< broker_device_snapshot > & devices );
++    }
++}
+diff --git a/src/libusb/broker/device-broker.cpp b/src/libusb/broker/device-broker.cpp
+new file mode 100644
+index 000000000..7bd6613a8
+--- /dev/null
++++ b/src/libusb/broker/device-broker.cpp
+@@ -0,0 +1,128 @@
++// License: Apache 2.0. See LICENSE file in root directory.
++// Copyright(c) 2026 RealSense, Inc. All Rights Reserved.
++
++#include "device-broker.h"
++#include "messenger-broker.h"
++#include "../interface-libusb.h"
++
++#include <rsutils/easylogging/easyloggingpp.h>
++
++#include <algorithm>
++#include <cstring>
++
++namespace librealsense
++{
++    namespace platform
++    {
++        // {bLength, bDescriptorType, bLength bytes}; bytes beyond what the wire carries stay zero
++        static usb_descriptor make_descriptor( const uint8_t * p, size_t available )
++        {
++            usb_descriptor ud = { p[0], p[1], std::vector< uint8_t >( p[0] ) };
++            memcpy( ud.data.data(), p, std::min< size_t >( p[0], available ) );
++            return ud;
++        }
++
++        usb_device_broker::usb_device_broker( const std::shared_ptr< usb_broker > & broker,
++                                              const broker_device_snapshot & snapshot, const usb_device_info & info,
++                                              uint64_t generation )
++            : _broker( broker )
++            , _info( info )
++            , _token( snapshot.token )
++            , _generation( generation )
++            , _path( snapshot.path )
++            , _callback_queue( dispatch_queue_create(
++                  "librealsense.usb-broker.device",
++                  dispatch_queue_attr_make_with_qos_class( DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0 ) ) )
++        {
++            _descriptors.push_back( make_descriptor( snapshot.device_desc.data(), snapshot.device_desc.size() ) );
++
++            // Same interfaces, association rule and descriptor order as usb_device_libusb, from libusb structs
++            std::shared_ptr< usb_interface_libusb > curr_ctrl_intf;
++            for( size_t i = 0; i < snapshot.interfaces.size(); ++i )
++            {
++                auto & intf = snapshot.interfaces[i];
++                if( i && intf.config != snapshot.interfaces[i - 1].config )
++                    curr_ctrl_intf.reset();
++
++                std::vector< libusb_endpoint_descriptor > eps( intf.endpoints.size() / RSUSB_ENDPOINT_WIRE_LEN );
++                for( size_t e = 0; e < eps.size(); ++e )
++                {
++                    const uint8_t * p = &intf.endpoints[e * RSUSB_ENDPOINT_WIRE_LEN];
++                    eps[e] = {};
++                    eps[e].bLength = p[0];
++                    eps[e].bDescriptorType = p[1];
++                    eps[e].bEndpointAddress = p[2];
++                    eps[e].bmAttributes = p[3];
++                    eps[e].wMaxPacketSize = uint16_t( p[4] | p[5] << 8 );
++                    eps[e].bInterval = p[6];
++                }
++                std::vector< libusb_interface_descriptor > alts( intf.alts.size() );
++                for( size_t j = 0; j < alts.size(); ++j )
++                {
++                    const uint8_t * d = intf.alts[j].desc.data();
++                    alts[j] = {};
++                    alts[j].bLength = d[0];
++                    alts[j].bDescriptorType = d[1];
++                    alts[j].bInterfaceNumber = d[2];
++                    alts[j].bAlternateSetting = d[3];
++                    alts[j].bNumEndpoints = d[4];
++                    alts[j].bInterfaceClass = d[5];
++                    alts[j].bInterfaceSubClass = d[6];
++                    alts[j].bInterfaceProtocol = d[7];
++                    alts[j].iInterface = d[8];
++                }
++                alts[0].endpoint = eps.data();
++                libusb_interface li = { alts.data(), int( alts.size() ) };
++
++                auto curr_inf = std::make_shared< usb_interface_libusb >( li );
++                _interfaces.push_back( curr_inf );
++                if( alts[0].bInterfaceClass == RS2_USB_CLASS_VIDEO )
++                {
++                    if( alts[0].bInterfaceSubClass == RS2_USB_SUBCLASS_VIDEO_CONTROL )
++                        curr_ctrl_intf = curr_inf;
++                    if( alts[0].bInterfaceSubClass == RS2_USB_SUBCLASS_VIDEO_STREAMING && curr_ctrl_intf )
++                        curr_ctrl_intf->add_associated_interface( curr_inf );
++                }
++
++                for( auto & alt : intf.alts )
++                {
++                    _descriptors.push_back( make_descriptor( alt.desc.data(), alt.desc.size() ) );
++                    auto & x = alt.extra;
++                    for( size_t k = 0; k + 1 < x.size() && x[k] >= 2 && k + x[k] <= x.size(); k += x[k] )
++                        _descriptors.push_back( make_descriptor( &x[k], x[k] ) );
++                }
++            }
++        }
++
++        usb_device_broker::~usb_device_broker()
++        {
++            dispatch_release( _callback_queue );
++        }
++
++        const rs_usb_interface usb_device_broker::get_interface( uint8_t interface_number ) const
++        {
++            auto it = std::find_if( _interfaces.begin(), _interfaces.end(),
++                                    [interface_number]( const rs_usb_interface & i ) { return interface_number == i->get_number(); } );
++            return it == _interfaces.end() ? nullptr : *it;
++        }
++
++        const rs_usb_messenger usb_device_broker::open( uint8_t interface_number )
++        {
++            if( ! alive() || ! get_interface( interface_number ) )
++                return nullptr;
++            auto msg = broker_message( RSUSB_OP_OPEN );
++            xpc_dictionary_set_uint64( msg.get(), RSUSB_KEY_TOKEN, _token );
++            xpc_dictionary_set_uint64( msg.get(), RSUSB_KEY_INTERFACE, interface_number );
++            auto reply = _broker->call( _generation, msg.get(), RSUSB_DEVICE_CALL_TIMEOUT_MS, true );
++            uint64_t h;
++            if( reply.result != broker_reply::ok || reply.status != RSUSB_ST_SUCCESS
++                || ! xpc_get_u64( reply.msg.get(), RSUSB_KEY_HANDLE, h ) || ! h )
++            {
++                LOG_ERROR( "failed to open usb interface: " << (int)interface_number << ", error: "
++                                                            << usb_status_to_string.at( broker_status_to_rs( reply ) ) );
++                return nullptr;
++            }
++            return std::make_shared< usb_messenger_broker >( shared_from_this(), h );
++        }
++    }
++}
+diff --git a/src/libusb/broker/device-broker.h b/src/libusb/broker/device-broker.h
+new file mode 100644
+index 000000000..266ece6e2
+--- /dev/null
++++ b/src/libusb/broker/device-broker.h
+@@ -0,0 +1,48 @@
++// License: Apache 2.0. See LICENSE file in root directory.
++// Copyright(c) 2026 RealSense, Inc. All Rights Reserved.
++
++#pragma once
++
++#include "broker-connection.h"
++
++#include <atomic>
++
++namespace librealsense
++{
++    namespace platform
++    {
++        // A device leased from the broker; descriptors, interfaces and endpoints are built once from the ENUMERATE snapshot
++        class usb_device_broker : public usb_device, public std::enable_shared_from_this< usb_device_broker >
++        {
++        public:
++            usb_device_broker( const std::shared_ptr< usb_broker > & broker, const broker_device_snapshot & snapshot,
++                               const usb_device_info & info, uint64_t generation );
++            virtual ~usb_device_broker() override;
++
++            virtual const usb_device_info get_info() const override { return _info; }
++            virtual const std::vector< rs_usb_interface > get_interfaces() const override { return _interfaces; }
++            virtual const rs_usb_interface get_interface( uint8_t interface_number ) const override;
++            virtual const rs_usb_messenger open( uint8_t interface_number ) override;
++            virtual const std::vector< usb_descriptor > get_descriptors() const override { return _descriptors; }
++
++            const std::shared_ptr< usb_broker > & get_broker() const { return _broker; }
++            uint64_t get_token() const { return _token; }
++            uint64_t get_generation() const { return _generation; }
++            const std::string & get_path() const { return _path; }
++            dispatch_queue_t callback_queue() const { return _callback_queue; }
++            bool alive() const { return ! _dead && _broker->is_current( _generation ); }
++            void set_dead() { _dead = true; }
++
++        private:
++            const std::shared_ptr< usb_broker > _broker;
++            const usb_device_info _info;
++            const uint64_t _token;
++            const uint64_t _generation;
++            const std::string _path;
++            std::atomic< bool > _dead{ false };
++            dispatch_queue_t _callback_queue;   // request completions, in order
++            std::vector< rs_usb_interface > _interfaces;
++            std::vector< usb_descriptor > _descriptors;
++        };
++    }
++}
+diff --git a/src/libusb/broker/messenger-broker.cpp b/src/libusb/broker/messenger-broker.cpp
+new file mode 100644
+index 000000000..132320428
+--- /dev/null
++++ b/src/libusb/broker/messenger-broker.cpp
+@@ -0,0 +1,133 @@
++// License: Apache 2.0. See LICENSE file in root directory.
++// Copyright(c) 2026 RealSense, Inc. All Rights Reserved.
++
++#include "messenger-broker.h"
++#include "request-broker.h"
++
++#include <rsutils/easylogging/easyloggingpp.h>
++
++#include <cstring>
++
++namespace librealsense
++{
++    namespace platform
++    {
++        usb_messenger_broker::usb_messenger_broker( const std::shared_ptr< usb_device_broker > & device, uint64_t handle )
++            : _device( device )
++            , _handle( handle )
++        {
++        }
++
++        usb_messenger_broker::~usb_messenger_broker()
++        {
++            auto & broker = _device->get_broker();
++            if( ! broker->is_current( _device->get_generation() ) )
++                return;
++            auto msg = broker_message( RSUSB_OP_CLOSE );
++            xpc_dictionary_set_uint64( msg.get(), RSUSB_KEY_HANDLE, _handle );
++            // A lost device's handle stays in the daemon's table (and quota) until CLOSE; its device queue may be wedged
++            if( _device->alive() )
++                broker->call( _device->get_generation(), msg.get(), RSUSB_DEVICE_CALL_TIMEOUT_MS, true );
++            else
++                broker->send( _device->get_generation(), msg.get(), true );
++        }
++
++        usb_status usb_messenger_broker::transfer( xpc_object_t msg, bool in, uint8_t * buffer, uint32_t length,
++                                                   uint32_t & transferred, uint32_t timeout_ms )
++        {
++            xpc_dictionary_set_uint64( msg, RSUSB_KEY_HANDLE, _handle );
++            xpc_dictionary_set_uint64( msg, RSUSB_KEY_LENGTH, length );
++            xpc_dictionary_set_uint64( msg, RSUSB_KEY_TIMEOUT, timeout_ms );
++            if( ! in && length )
++                xpc_dictionary_set_data( msg, RSUSB_KEY_DATA, buffer, length );
++            // The daemon's own timeout fires first; a missing reply after the margin is a timeout, not a session loss
++            uint32_t clamped = timeout_ms == 0 || timeout_ms > RSUSB_MAX_TIMEOUT_MS ? RSUSB_MAX_TIMEOUT_MS : timeout_ms;
++            auto reply = _device->get_broker()->call( _device->get_generation(), msg, clamped + RSUSB_REPLY_MARGIN_MS, false );
++            if( reply.result != broker_reply::ok || reply.status != RSUSB_ST_SUCCESS )
++                return broker_status_to_rs( reply );
++            uint64_t n;
++            std::vector< uint8_t > data;
++            if( ! xpc_get_u64( reply.msg.get(), RSUSB_KEY_TRANSFERRED, n ) || n > length
++                || ( in && ( ! xpc_get_data( reply.msg.get(), RSUSB_KEY_DATA, data ) || data.size() != n ) ) )
++                return RS2_USB_STATUS_OTHER;
++            if( in && n )
++                memcpy( buffer, data.data(), n );
++            transferred = uint32_t( n );
++            return RS2_USB_STATUS_SUCCESS;
++        }
++
++        usb_status usb_messenger_broker::control_transfer( int request_type, int request, int value, int index, uint8_t * buffer,
++                                                           uint32_t length, uint32_t & transferred, uint32_t timeout_ms )
++        {
++            if( ! _device->alive() )
++                return RS2_USB_STATUS_NO_DEVICE;
++            if( length > RSUSB_MAX_CONTROL_LEN || ( length && ! buffer ) )
++                return RS2_USB_STATUS_INVALID_PARAM;
++            auto msg = broker_message( RSUSB_OP_CONTROL );
++            xpc_dictionary_set_uint64( msg.get(), RSUSB_KEY_REQUEST_TYPE, uint8_t( request_type ) );
++            xpc_dictionary_set_uint64( msg.get(), RSUSB_KEY_REQUEST, uint8_t( request ) );
++            xpc_dictionary_set_uint64( msg.get(), RSUSB_KEY_VALUE, uint16_t( value ) );
++            xpc_dictionary_set_uint64( msg.get(), RSUSB_KEY_INDEX, uint16_t( index ) );
++            auto sts = transfer( msg.get(), request_type & 0x80, buffer, length, transferred, timeout_ms );
++            if( sts != RS2_USB_STATUS_SUCCESS )
++                LOG_WARNING( "control_transfer returned error, index: " << index << ", value: " << value
++                                                                        << ", error: " << usb_status_to_string.at( sts ) );
++            return sts;
++        }
++
++        usb_status usb_messenger_broker::bulk_transfer( const rs_usb_endpoint & endpoint, uint8_t * buffer, uint32_t length,
++                                                        uint32_t & transferred, uint32_t timeout_ms )
++        {
++            if( endpoint->get_type() != RS2_USB_ENDPOINT_BULK && endpoint->get_type() != RS2_USB_ENDPOINT_INTERRUPT )
++            {
++                LOG_ERROR( "Invalid transfer type " << endpoint->get_type() << " on endpoint " << int( endpoint->get_address() ) );
++                return RS2_USB_STATUS_OTHER;
++            }
++            if( ! _device->alive() )
++                return RS2_USB_STATUS_NO_DEVICE;
++            if( length > RSUSB_MAX_BULK_LEN || ( length && ! buffer ) )
++                return RS2_USB_STATUS_INVALID_PARAM;
++            auto msg = broker_message( RSUSB_OP_BULK );
++            xpc_dictionary_set_uint64( msg.get(), RSUSB_KEY_ENDPOINT, endpoint->get_address() );
++            auto sts = transfer( msg.get(), endpoint->get_address() & 0x80, buffer, length, transferred, timeout_ms );
++            if( sts != RS2_USB_STATUS_SUCCESS )
++                LOG_WARNING( "bulk_transfer returned error, endpoint: 0x" << std::hex << int( endpoint->get_address() ) << std::dec
++                                                                         << ", error: " << usb_status_to_string.at( sts ) );
++            return sts;
++        }
++
++        usb_status usb_messenger_broker::reset_endpoint( const rs_usb_endpoint & endpoint, uint32_t /*timeout_ms*/ )
++        {
++            if( ! _device->alive() )
++                return RS2_USB_STATUS_NO_DEVICE;
++            auto msg = broker_message( RSUSB_OP_RESET_EP );
++            xpc_dictionary_set_uint64( msg.get(), RSUSB_KEY_HANDLE, _handle );
++            xpc_dictionary_set_uint64( msg.get(), RSUSB_KEY_ENDPOINT, endpoint->get_address() );
++            auto reply = _device->get_broker()->call( _device->get_generation(), msg.get(), RSUSB_DEVICE_CALL_TIMEOUT_MS, true );
++            auto sts = reply.result == broker_reply::timeout ? RS2_USB_STATUS_NO_DEVICE : broker_status_to_rs( reply );
++            if( sts != RS2_USB_STATUS_SUCCESS )
++                LOG_WARNING( "reset_endpoint returned error, index: " << int( endpoint->get_address() )
++                                                                      << ", error: " << usb_status_to_string.at( sts ) );
++            return sts;
++        }
++
++        rs_usb_request usb_messenger_broker::create_request( rs_usb_endpoint endpoint )
++        {
++            auto rv = std::make_shared< usb_request_broker >( _device, _handle, endpoint );
++            rv->set_shared( rv );
++            return rv;
++        }
++
++        usb_status usb_messenger_broker::submit_request( const rs_usb_request & request )
++        {
++            auto req = std::dynamic_pointer_cast< usb_request_broker >( request );
++            return req ? req->submit() : RS2_USB_STATUS_INVALID_PARAM;
++        }
++
++        usb_status usb_messenger_broker::cancel_request( const rs_usb_request & request )
++        {
++            auto req = std::dynamic_pointer_cast< usb_request_broker >( request );
++            return req ? req->cancel() : RS2_USB_STATUS_INVALID_PARAM;
++        }
++    }
++}
+diff --git a/src/libusb/broker/messenger-broker.h b/src/libusb/broker/messenger-broker.h
+new file mode 100644
+index 000000000..de355d8c5
+--- /dev/null
++++ b/src/libusb/broker/messenger-broker.h
+@@ -0,0 +1,34 @@
++// License: Apache 2.0. See LICENSE file in root directory.
++// Copyright(c) 2026 RealSense, Inc. All Rights Reserved.
++
++#pragma once
++
++#include "device-broker.h"
++#include "usb/usb-messenger.h"
++
++namespace librealsense
++{
++    namespace platform
++    {
++        // One daemon messenger handle: the claimed interface and its associated interfaces
++        class usb_messenger_broker : public usb_messenger
++        {
++        public:
++            usb_messenger_broker( const std::shared_ptr< usb_device_broker > & device, uint64_t handle );
++            virtual ~usb_messenger_broker() override;
++
++            virtual usb_status control_transfer( int request_type, int request, int value, int index, uint8_t * buffer, uint32_t length, uint32_t & transferred, uint32_t timeout_ms ) override;
++            virtual usb_status bulk_transfer( const rs_usb_endpoint & endpoint, uint8_t * buffer, uint32_t length, uint32_t & transferred, uint32_t timeout_ms ) override;
++            virtual usb_status reset_endpoint( const rs_usb_endpoint & endpoint, uint32_t timeout_ms ) override;
++            virtual usb_status submit_request( const rs_usb_request & request ) override;
++            virtual usb_status cancel_request( const rs_usb_request & request ) override;
++            virtual rs_usb_request create_request( rs_usb_endpoint endpoint ) override;
++
++        private:
++            usb_status transfer( xpc_object_t msg, bool in, uint8_t * buffer, uint32_t length, uint32_t & transferred, uint32_t timeout_ms );
++
++            const std::shared_ptr< usb_device_broker > _device;
++            const uint64_t _handle;
++        };
++    }
++}
+diff --git a/src/libusb/broker/request-broker.cpp b/src/libusb/broker/request-broker.cpp
+new file mode 100644
+index 000000000..2e2730afb
+--- /dev/null
++++ b/src/libusb/broker/request-broker.cpp
+@@ -0,0 +1,230 @@
++// License: Apache 2.0. See LICENSE file in root directory.
++// Copyright(c) 2026 RealSense, Inc. All Rights Reserved.
++
++#include "request-broker.h"
++
++#include <rsutils/easylogging/easyloggingpp.h>
++
++#include <algorithm>
++#include <chrono>
++#include <cstring>
++#include <thread>
++
++#include <sys/mman.h>
++
++namespace librealsense
++{
++    namespace platform
++    {
++        usb_request_broker::usb_request_broker( const std::shared_ptr< usb_device_broker > & device, uint64_t handle,
++                                                rs_usb_endpoint endpoint )
++            : _device( device )
++            , _handle( handle )
++        {
++            _endpoint = endpoint;
++        }
++
++        usb_request_broker::~usb_request_broker()
++        {
++            if( _active && _remote )
++            {
++                auto msg = broker_message( RSUSB_OP_REQ_CANCEL );
++                xpc_dictionary_set_uint64( msg.get(), RSUSB_KEY_REQUEST_ID, _remote );
++                _device->get_broker()->send( _device->get_generation(), msg.get(), true );
++            }
++            auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds( 100 );
++            while( _active && std::chrono::steady_clock::now() < deadline )
++                std::this_thread::sleep_for( std::chrono::milliseconds( 1 ) );
++            // The daemon frees an in-flight transfer after it completes, and sends no completion for it
++            if( _active )
++                LOG_WARNING( "active request didn't return on time" );
++            destroy_remote();
++        }
++
++        void usb_request_broker::set_native_buffer_length( int length )
++        {
++            std::lock_guard< std::mutex > lock( _mutex );
++            _native_length = length;
++        }
++
++        int usb_request_broker::get_native_buffer_length()
++        {
++            std::lock_guard< std::mutex > lock( _mutex );
++            return _native_length;
++        }
++
++        void usb_request_broker::set_native_buffer( uint8_t * buffer )
++        {
++            std::lock_guard< std::mutex > lock( _mutex );
++            _native_buffer = buffer;
++        }
++
++        uint8_t * usb_request_broker::get_native_buffer() const
++        {
++            std::lock_guard< std::mutex > lock( _mutex );
++            return _native_buffer;
++        }
++
++        usb_status usb_request_broker::create_remote( int length )
++        {
++            auto & broker = _device->get_broker();
++            auto generation = _device->get_generation();
++            auto msg = broker_message( RSUSB_OP_REQ_CREATE );
++            xpc_dictionary_set_uint64( msg.get(), RSUSB_KEY_HANDLE, _handle );
++            xpc_dictionary_set_uint64( msg.get(), RSUSB_KEY_ENDPOINT, _endpoint->get_address() );
++            xpc_dictionary_set_uint64( msg.get(), RSUSB_KEY_LENGTH, length );
++            auto reply = broker->call( generation, msg.get(), RSUSB_CALL_TIMEOUT_MS, true );
++            if( reply.result != broker_reply::ok || reply.status != RSUSB_ST_SUCCESS )
++                return reply.result == broker_reply::timeout ? RS2_USB_STATUS_NO_DEVICE : broker_status_to_rs( reply );
++
++            uint64_t r = 0;
++            xpc_object_t shm;
++            void * addr = nullptr;
++            size_t size = 0;
++            if( xpc_get_u64( reply.msg.get(), RSUSB_KEY_REQUEST_ID, r ) && r
++                && xpc_get_shmem( reply.msg.get(), RSUSB_KEY_SHMEM, shm ) )
++                size = xpc_shmem_map( shm, &addr );
++            auto routes = broker->routes( generation );
++            if( ! routes || ! addr || size < size_t( length ) )
++            {
++                if( addr )
++                    munmap( addr, size );
++                if( r )
++                {
++                    msg = broker_message( RSUSB_OP_REQ_DESTROY );
++                    xpc_dictionary_set_uint64( msg.get(), RSUSB_KEY_REQUEST_ID, r );
++                    broker->send( generation, msg.get(), false );
++                }
++                return routes ? RS2_USB_STATUS_OTHER : RS2_USB_STATUS_NO_DEVICE;
++            }
++            {
++                std::lock_guard< std::mutex > lock( routes->mutex );
++                routes->routes[r] = this;
++            }
++            std::lock_guard< std::mutex > lock( _mutex );
++            _remote = r;
++            _remote_length = length;
++            _shm = addr;
++            _shm_size = size;
++            _routes = routes;
++            return RS2_USB_STATUS_SUCCESS;
++        }
++
++        void usb_request_broker::destroy_remote()
++        {
++            if( ! _remote )
++                return;
++            {
++                std::unique_lock< std::mutex > lock( _routes->mutex );
++                _routes->routes.erase( _remote );
++                _routes->idle.wait( lock, [this]() { return _pins == 0; } );
++            }
++            {
++                std::lock_guard< std::mutex > lock( _mutex );
++                munmap( _shm, _shm_size );
++                _shm = nullptr;
++                _shm_size = 0;
++            }
++            auto msg = broker_message( RSUSB_OP_REQ_DESTROY );
++            xpc_dictionary_set_uint64( msg.get(), RSUSB_KEY_REQUEST_ID, _remote );
++            _device->get_broker()->send( _device->get_generation(), msg.get(), false );
++            _remote = 0;
++            _routes.reset();
++        }
++
++        usb_status usb_request_broker::submit()
++        {
++            if( ! _device->alive() )
++                return RS2_USB_STATUS_NO_DEVICE;
++            if( _endpoint->get_type() != RS2_USB_ENDPOINT_BULK && _endpoint->get_type() != RS2_USB_ENDPOINT_INTERRUPT )
++                return RS2_USB_STATUS_INVALID_PARAM;
++            if( _active )
++                return RS2_USB_STATUS_BUSY;
++            int length = get_native_buffer_length();
++            if( length < 1 || uint64_t( length ) > RSUSB_MAX_REQUEST_LEN )
++                return RS2_USB_STATUS_INVALID_PARAM;
++            if( ! _remote || _remote_length != length )
++            {
++                destroy_remote();
++                auto sts = create_remote( length );
++                if( sts != RS2_USB_STATUS_SUCCESS )
++                {
++                    LOG_WARNING( "usb_request_queue returned error, endpoint: " << (int)_endpoint->get_address()
++                                                                                << " error: " << usb_status_to_string.at( sts ) );
++                    return sts;
++                }
++            }
++
++            _active = true;
++            auto msg = broker_message( RSUSB_OP_REQ_SUBMIT );
++            xpc_dictionary_set_uint64( msg.get(), RSUSB_KEY_REQUEST_ID, _remote );
++            auto reply = _device->get_broker()->call( _device->get_generation(), msg.get(), RSUSB_CALL_TIMEOUT_MS, true );
++            if( reply.result == broker_reply::ok && reply.status == RSUSB_ST_SUCCESS )
++                return RS2_USB_STATUS_SUCCESS;
++            auto sts = reply.result == broker_reply::timeout ? RS2_USB_STATUS_NO_DEVICE : broker_status_to_rs( reply );
++            std::lock_guard< std::mutex > lock( _mutex );
++            // A completion already delivered for this submission (session loss) stands for the result
++            if( ! _active )
++                return RS2_USB_STATUS_SUCCESS;
++            _active = false;
++            LOG_WARNING( "usb_request_queue returned error, endpoint: " << (int)_endpoint->get_address()
++                                                                        << " error: " << usb_status_to_string.at( sts ) );
++            return sts;
++        }
++
++        usb_status usb_request_broker::cancel()
++        {
++            if( ! _remote || ! _active || ! _device->get_broker()->is_current( _device->get_generation() ) )
++                return RS2_USB_STATUS_SUCCESS;
++            auto msg = broker_message( RSUSB_OP_REQ_CANCEL );
++            xpc_dictionary_set_uint64( msg.get(), RSUSB_KEY_REQUEST_ID, _remote );
++            auto reply = _device->get_broker()->call( _device->get_generation(), msg.get(), RSUSB_CALL_TIMEOUT_MS, true );
++            if( reply.result == broker_reply::ok
++                && ( reply.status == RSUSB_ST_SUCCESS || reply.status == RSUSB_ST_NOT_FOUND ) )
++                return RS2_USB_STATUS_SUCCESS;
++            auto sts = reply.result == broker_reply::timeout ? RS2_USB_STATUS_NO_DEVICE : broker_status_to_rs( reply );
++            LOG_WARNING( "usb_request_cancel returned error, endpoint: " << (int)_endpoint->get_address()
++                                                                         << " error: " << usb_status_to_string.at( sts ) );
++            return sts;
++        }
++
++        void usb_request_broker::deliver( const std::shared_ptr< broker_route_table > & routes, uint64_t r, uint64_t xs,
++                                          uint64_t n )
++        {
++            usb_request_broker * req;
++            {
++                std::lock_guard< std::mutex > lock( routes->mutex );
++                auto it = routes->routes.find( r );
++                if( it == routes->routes.end() )
++                    return;
++                req = it->second;
++                ++req->_pins;
++            }
++            std::shared_ptr< usb_request > response;
++            bool lost = false;
++            {
++                std::lock_guard< std::mutex > lock( req->_mutex );
++                // Not active: a duplicate of a completion already delivered (session loss vs. late REQ_DONE)
++                if( req->_active )
++                {
++                    size_t count = std::min( { size_t( n ), req->_shm_size, size_t( std::max( req->_native_length, 0 ) ) } );
++                    if( count && req->_native_buffer )
++                        memcpy( req->_native_buffer, req->_shm, count );
++                    req->_actual_length = int( count );
++                    lost = xs == RSUSB_XS_NO_DEVICE;
++                    response = req->get_shared();
++                    req->_active = false;
++                }
++            }
++            if( lost )
++                req->_device->get_broker()->device_lost( req->_device->get_generation(), req->_device->get_token() );
++            {
++                std::lock_guard< std::mutex > lock( routes->mutex );
++                --req->_pins;
++            }
++            routes->idle.notify_all();
++            if( response && response->get_callback() )
++                response->get_callback()->callback( response );
++        }
++    }
++}
+diff --git a/src/libusb/broker/request-broker.h b/src/libusb/broker/request-broker.h
+new file mode 100644
+index 000000000..3e00679b8
+--- /dev/null
++++ b/src/libusb/broker/request-broker.h
+@@ -0,0 +1,64 @@
++// License: Apache 2.0. See LICENSE file in root directory.
++// Copyright(c) 2026 RealSense, Inc. All Rights Reserved.
++
++#pragma once
++
++#include "device-broker.h"
++#include "usb/usb-request.h"
++
++#include <atomic>
++#include <mutex>
++
++namespace librealsense
++{
++    namespace platform
++    {
++        // An async IN request backed by a daemon request and its shared memory; data is copied into the native buffer
++        // before the callback runs
++        class usb_request_broker : public usb_request_base
++        {
++        public:
++            usb_request_broker( const std::shared_ptr< usb_device_broker > & device, uint64_t handle, rs_usb_endpoint endpoint );
++            virtual ~usb_request_broker();
++
++            virtual int get_actual_length() const override { return _actual_length; }
++            virtual void * get_native_request() const override { return const_cast< usb_request_broker * >( this ); }
++
++            std::shared_ptr< usb_request > get_shared() const { return _shared.lock(); }
++            void set_shared( const std::shared_ptr< usb_request > & shared ) { _shared = shared; }
++            dispatch_queue_t callback_queue() const { return _device->callback_queue(); }
++
++            usb_status submit();
++            usb_status cancel();
++            // On the device's callback queue: one completion of request r of the session owning routes
++            static void deliver( const std::shared_ptr< broker_route_table > & routes, uint64_t r, uint64_t xs, uint64_t n );
++
++        protected:
++            virtual void set_native_buffer_length( int length ) override;
++            virtual int get_native_buffer_length() override;
++            virtual void set_native_buffer( uint8_t * buffer ) override;
++            virtual uint8_t * get_native_buffer() const override;
++
++        private:
++            usb_status create_remote( int length );
++            void destroy_remote();
++
++            const std::shared_ptr< usb_device_broker > _device;
++            const uint64_t _handle;
++            std::weak_ptr< usb_request > _shared;
++            std::atomic< bool > _active{ false };
++            std::atomic< int > _actual_length{ 0 };
++
++            mutable std::mutex _mutex;   // native buffer and mapping vs. completion
++            uint8_t * _native_buffer = nullptr;
++            int _native_length = 0;
++            std::atomic< uint64_t > _remote{ 0 };
++            int _remote_length = 0;
++            void * _shm = nullptr;
++            size_t _shm_size = 0;
++
++            std::shared_ptr< broker_route_table > _routes;   // the table this request is routed in
++            int _pins = 0;                                     // completions in progress, guarded by _routes->mutex
++        };
++    }
++}
+diff --git a/src/libusb/broker/rs-usb-broker-protocol.h b/src/libusb/broker/rs-usb-broker-protocol.h
+new file mode 100644
+index 000000000..1bcba8210
+--- /dev/null
++++ b/src/libusb/broker/rs-usb-broker-protocol.h
+@@ -0,0 +1,300 @@
++/* License: Apache 2.0. See LICENSE file in root directory.
++ *
++ * Wire protocol between librealsense's RSUSB broker client (src/libusb/broker/, C++14) and the macOS USB broker
++ * daemon realsense-usbd (macos/broker/daemon/, C++17). Plain C so both sides compile the same file; the copy at
++ * third_party/librealsense/src/libusb/broker/rs-usb-broker-protocol.h must stay byte-identical (build.sh checks).
++ * Normative together with macos/broker/DESIGN.md; where CONTRACT.md disagrees, DESIGN.md section 11 wins.
++ *
++ * Transport: libxpc dictionaries on the Mach service RSUSB_SERVICE_NAME (client: XPC_CONNECTION_MACH_SERVICE_PRIVILEGED).
++ * Every client request carries RSUSB_KEY_OP and is sent with a reply (xpc_connection_send_message_with_reply) unless
++ * marked "no reply". Daemon -> client messages that are not replies carry RSUSB_KEY_EVENT instead.
++ *
++ * Types: every integer is an xpc uint64 except RSUSB_KEY_STATUS, an xpc int64. "data" is an xpc data object, "string"
++ * an xpc string, "array" an xpc array, "shmem" an xpc_shmem object. Both sides MUST read every key through a typed
++ * getter (xpc_dictionary_get_value + xpc_get_type check) - never xpc_dictionary_get_uint64/_get_data alone, because
++ * they return 0/NULL for a missing key and 0 is a valid value of if, rq, val, idx. Keys not listed for a message are
++ * ignored by the receiver (the daemon ignores any shm a client sends). A request with a missing key or a key of the
++ * wrong type is malformed: the daemon cancels the connection. Out-of-range values in a well-formed request are
++ * answered with a status.
++ *
++ * Ids: h (messenger) and r (request) are assigned by the daemon per connection, monotonically increasing from 1,
++ * 64-bit, never reused within a connection. tok (device) is never reused within a daemon run. A client keeps all
++ * three scoped to its session (one HELLO on one connection) and never compares them across sessions.
++ *
++ * Status (RSUSB_KEY_STATUS) is the libusb error code of the operation the daemon performed for the client (libusb 1.0.30
++ * numbering, rsusb_status below). The client maps it exactly like libusb_status_to_rs() in src/libusb/handle-libusb.h:
++ * -1..-12 identity, everything else (incl. RSUSB_ST_OTHER = -99 and unknown values) -> RS2_USB_STATUS_OTHER.
++ *
++ * Message schemas ("->" request keys, "<-" reply keys):
++ *
++ * HELLO: must be the first message on a connection; any other op first, or a second HELLO, cancels the connection.
++ *   -> op, pv (client RSUSB_PROTOCOL_VERSION)
++ *   <- st (0), pv (daemon RSUSB_PROTOCOL_VERSION), auth (rsusb_auth), build (string, <= RSUSB_MAX_BUILD_LEN, diagnostics)
++ *   The client uses the broker only if st == 0, auth == RSUSB_AUTH_OK and pv == its own RSUSB_PROTOCOL_VERSION.
++ *   After auth != OK the daemon answers nothing else and cancels the connection after sending the reply.
++ *   A peer that fails the code-signing requirement gets no reply: its messages are dropped and the daemon cancels any
++ *   connection still without HELLO after RSUSB_NEW_TIMEOUT_MS, so the client sees XPC_ERROR_CONNECTION_INVALID
++ *   (final, no retry) about one second after connecting.
++ *
++ * ENUMERATE: snapshot of the allowed RealSense devices (DESIGN 2.4.1), sorted by IORegistry entry ID ascending,
++ *   served from the daemon's cache (no device I/O).
++ *   -> op
++ *   <- st, devs (array, <= RSUSB_MAX_DEVICES, of device dictionaries):
++ *        tok  device token: nonzero, unique per physical device instance for the daemon's lifetime; a re-enumerated
++ *             device (hand-back, HWRST, DFU, re-plug) gets a new token
++ *        path string "<bus>-<p1>.<p2>...-<address>" exactly as get_device_path() (src/libusb/enumerator-libusb.cpp),
++ *             1..RSUSB_MAX_PATH_LEN bytes. The path is librealsense's device id and usually does NOT change when the
++ *             device re-enumerates on Apple Silicon (a D455 alone on its bus comes back as 1-1-1): a new tok with an
++ *             unchanged path is normal.
++ *        dd   data, RSUSB_DEVICE_DESC_LEN bytes: the device descriptor in wire order (bLength..bNumConfigurations)
++ *        ifs  array (<= RSUSB_MAX_INTERFACES per configuration) of interface dictionaries, config->interface[] order,
++ *             configurations concatenated in index order. A device is listed only when every configuration was read
++ *             successfully; an interface that exceeds a limit is left out (and logged), the device is still listed.
++ *          cfg  configuration index c (0..bNumConfigurations-1); usb_device_info::mi = position within that cfg
++ *          alts array (1..RSUSB_MAX_ALTSETTINGS) of altsetting dictionaries, altsetting[] order:
++ *            d  data, RSUSB_INTERFACE_DESC_LEN bytes: bLength, bDescriptorType, bInterfaceNumber, bAlternateSetting,
++ *               bNumEndpoints, bInterfaceClass, bInterfaceSubClass, bInterfaceProtocol, iInterface (libusb values)
++ *            x  data, 0..RSUSB_MAX_EXTRA_LEN bytes: libusb's altsetting.extra, verbatim
++ *          eps  data, 7 * n bytes (n <= RSUSB_MAX_ENDPOINTS) for altsetting[0]'s endpoints in order, each:
++ *               bLength, bDescriptorType, bEndpointAddress, bmAttributes (raw), wMaxPacketSize (LE), bInterval
++ *
++ * LEASE: sent by create_usb_device() before it returns a device object. Takes this connection's lease on the device
++ *   (DESIGN 2.7) without opening or capturing it; idempotent; ends only with the connection or the device.
++ *   -> op, tok       <- st
++ *   st: NO_DEVICE unknown/gone token or hand-back in progress, ACCESS camera disabled by policy, NO_MEM lease limit.
++ *
++ * OPEN: one messenger (usb_device::open). Claims interface `if` (of the active configuration) and its associated
++ *   VIDEO_STREAMING interfaces (rule of device-libusb.cpp), all or nothing. Takes the lease if not yet held and
++ *   captures the device from macOS on the first OPEN of a device instance.
++ *   -> op, tok, if (bInterfaceNumber)
++ *   <- st, h (messenger handle, present iff st == 0)
++ *   st: NO_DEVICE unknown/gone token or hand-back in progress; NOT_FOUND no such interface in the active configuration;
++ *   ACCESS an interface of the claim set is held by another messenger (any connection, including this one), capture
++ *   refused, or camera disabled by policy; NO_MEM quota; BUSY only when libusb_claim_interface still fails with BUSY
++ *   after the daemon's retries; otherwise the libusb error. If an interface of the claim set is being released by a
++ *   CLOSE of this same connection, OPEN waits for that release instead of answering ACCESS.
++ *
++ * CLOSE: ends a messenger: cancels its bulk/interrupt transfers (never a control transfer), waits for all its transfers
++ *   to complete (control transfers run to completion, at most the clamped timeout), releases its interfaces, frees its
++ *   requests. Never ends the lease.
++ *   -> op, h       <- st
++ *
++ * CONTROL: libusb_control_transfer on EP0.
++ *   -> op, h, rt (bmRequestType), rq (bRequest), val (wValue), idx (wIndex), len (wLength <= RSUSB_MAX_CONTROL_LEN),
++ *      to (timeout ms), data (OUT only, exactly len bytes; absent when len == 0 or for IN)
++ *   <- st, n (bytes transferred, iff st == 0), data (IN only, exactly n bytes, iff st == 0)
++ *   rt must be RSUSB_RT_CLASS_IF_OUT or RSUSB_RT_CLASS_IF_IN and LOBYTE(idx) an interface claimed by h (else ACCESS).
++ *   No IN data is returned on failure (libusb in-process may copy partial IN data; librealsense discards it).
++ *
++ * BULK: synchronous transfer on a bulk or interrupt endpoint (bulk or interrupt chosen by the endpoint's raw
++ *   bmAttributes in the daemon's snapshot: 2 bulk, 3 interrupt, anything else INVALID_PARAM; no separate INTERRUPT op).
++ *   -> op, h, ep (bEndpointAddress), len (<= RSUSB_MAX_BULK_LEN), to, data (OUT only, exactly len bytes)
++ *   <- st, n (iff st == 0), data (IN only, exactly n bytes, iff st == 0)
++ *   ep must belong to an interface claimed by h (else NOT_FOUND).
++ *
++ * RESET_EP: libusb_clear_halt.   -> op, h, ep       <- st
++ *
++ * REQ_CREATE: allocates one async IN request (usb_request) and its page-aligned shared buffer.
++ *   -> op, h, ep (IN endpoint with raw bmAttributes 2 or 3 of an interface claimed by h), len (1..RSUSB_MAX_REQUEST_LEN)
++ *   <- st, r (request id), shm (shmem of at least len bytes)   (r and shm iff st == 0)
++ *
++ * REQ_SUBMIT: libusb_submit_transfer of the whole buffer, timeout 0. The reply is sent after the submit result is known;
++ *   REQ_DONE for this submission may arrive before the reply.
++ *   -> op, r       <- st (BUSY: already in flight; NO_DEVICE: device gone; NO_MEM: in-flight byte quota)
++ *
++ * REQ_CANCEL: libusb_cancel_transfer. st is libusb's result (NOT_FOUND when not in flight); REQ_DONE follows if it was.
++ *   -> op, r       <- st
++ *
++ * REQ_DESTROY (no reply): forget r. If in flight the daemon cancels it, frees it after its completion and sends no
++ *   REQ_DONE for it. Unknown r is ignored.
++ *   -> op, r
++ *
++ * Events (daemon -> client, no reply expected):
++ * REQ_DONE: one per completed submission, whatever the outcome; the first n bytes of shm hold the data.
++ *   ev, r, xs (rsusb_transfer_status), n (actual_length)
++ * DEVICE_GONE: the device behind tok disappeared; every op on its handles now fails with NO_DEVICE. Sent to every
++ *   connection holding a handle or a lease on tok, before the REQ_DONE(NO_DEVICE) completions it causes.
++ *   ev, tok
++ *
++ * Deadlines (client side): HELLO RSUSB_HELLO_TIMEOUT_MS; ENUMERATE, LEASE, REQ_CREATE, REQ_SUBMIT, REQ_CANCEL
++ * RSUSB_CALL_TIMEOUT_MS; OPEN, CLOSE, RESET_EP RSUSB_DEVICE_CALL_TIMEOUT_MS (> the daemon's RSUSB_WATCHDOG_MS, so the
++ * daemon answers NO_DEVICE first when a device wedges); CONTROL, BULK clamped `to` + RSUSB_REPLY_MARGIN_MS. A missed
++ * CONTROL/BULK deadline is RSUSB_ST_TIMEOUT; a missed ENUMERATE deadline is an empty list; any other missed deadline
++ * ends the session (the client cancels the connection, DESIGN 4.7.3).
++ */
++#ifndef RS_USB_BROKER_PROTOCOL_H
++#define RS_USB_BROKER_PROTOCOL_H
++
++#include <stdint.h>
++
++#define RSUSB_SERVICE_NAME "io.github.dolegadolegowski.realsense-usbd"
++#define RSUSB_PROTOCOL_VERSION 1u
++
++/* Keys */
++#define RSUSB_KEY_OP "op"
++#define RSUSB_KEY_EVENT "ev"
++#define RSUSB_KEY_STATUS "st"
++#define RSUSB_KEY_VERSION "pv"
++#define RSUSB_KEY_AUTH "auth"
++#define RSUSB_KEY_BUILD "build"
++#define RSUSB_KEY_DEVICES "devs"
++#define RSUSB_KEY_TOKEN "tok"
++#define RSUSB_KEY_PATH "path"
++#define RSUSB_KEY_DEVICE_DESC "dd"
++#define RSUSB_KEY_INTERFACES "ifs"
++#define RSUSB_KEY_CONFIG "cfg"
++#define RSUSB_KEY_ALTSETTINGS "alts"
++#define RSUSB_KEY_INTERFACE_DESC "d"
++#define RSUSB_KEY_EXTRA "x"
++#define RSUSB_KEY_ENDPOINTS "eps"
++#define RSUSB_KEY_INTERFACE "if"
++#define RSUSB_KEY_HANDLE "h"
++#define RSUSB_KEY_REQUEST_TYPE "rt"
++#define RSUSB_KEY_REQUEST "rq"
++#define RSUSB_KEY_VALUE "val"
++#define RSUSB_KEY_INDEX "idx"
++#define RSUSB_KEY_LENGTH "len"
++#define RSUSB_KEY_TIMEOUT "to"
++#define RSUSB_KEY_DATA "data"
++#define RSUSB_KEY_TRANSFERRED "n"
++#define RSUSB_KEY_ENDPOINT "ep"
++#define RSUSB_KEY_REQUEST_ID "r"
++#define RSUSB_KEY_SHMEM "shm"
++#define RSUSB_KEY_TRANSFER_STATUS "xs"
++
++enum rsusb_op
++{
++    RSUSB_OP_HELLO = 1,
++    RSUSB_OP_ENUMERATE = 2,
++    RSUSB_OP_OPEN = 3,
++    RSUSB_OP_CLOSE = 4,
++    RSUSB_OP_CONTROL = 5,
++    RSUSB_OP_BULK = 6,
++    RSUSB_OP_RESET_EP = 7,
++    RSUSB_OP_REQ_CREATE = 8,
++    RSUSB_OP_REQ_SUBMIT = 9,
++    RSUSB_OP_REQ_CANCEL = 10,
++    RSUSB_OP_REQ_DESTROY = 11,
++    RSUSB_OP_LEASE = 12
++};
++
++enum rsusb_event
++{
++    RSUSB_EV_REQ_DONE = 1,
++    RSUSB_EV_DEVICE_GONE = 2
++};
++
++enum rsusb_auth
++{
++    RSUSB_AUTH_OK = 0,
++    RSUSB_AUTH_VERSION = 1,          /* client pv not supported */
++    RSUSB_AUTH_USER = 2,             /* not root and not the console user in a local GUI session */
++    RSUSB_AUTH_CAMERA_DISABLED = 3,  /* com.apple.applicationaccess allowCamera not true (MDM / Screen Time) */
++    RSUSB_AUTH_LIMIT = 4             /* RSUSB_MAX_CLIENTS reached */
++};
++
++/* libusb_error values (libusb.h); usb_status uses the same numbers except OTHER (-13 there). */
++enum rsusb_status
++{
++    RSUSB_ST_SUCCESS = 0,
++    RSUSB_ST_IO = -1,
++    RSUSB_ST_INVALID_PARAM = -2,
++    RSUSB_ST_ACCESS = -3,
++    RSUSB_ST_NO_DEVICE = -4,
++    RSUSB_ST_NOT_FOUND = -5,
++    RSUSB_ST_BUSY = -6,
++    RSUSB_ST_TIMEOUT = -7,
++    RSUSB_ST_OVERFLOW = -8,
++    RSUSB_ST_PIPE = -9,
++    RSUSB_ST_INTERRUPTED = -10,
++    RSUSB_ST_NO_MEM = -11,
++    RSUSB_ST_NOT_SUPPORTED = -12,
++    RSUSB_ST_OTHER = -99
++};
++
++/* libusb_transfer_status values */
++enum rsusb_transfer_status
++{
++    RSUSB_XS_COMPLETED = 0,
++    RSUSB_XS_ERROR = 1,
++    RSUSB_XS_TIMED_OUT = 2,
++    RSUSB_XS_CANCELLED = 3,
++    RSUSB_XS_STALL = 4,
++    RSUSB_XS_NO_DEVICE = 5,
++    RSUSB_XS_OVERFLOW = 6
++};
++
++/* Device scope: any PID of RSUSB_VID_REALSENSE; for RSUSB_VID_INTEL only the PIDs of the build-generated list
++ * (DESIGN 2.4.1). Devices with an interface of a refused class are never listed or opened. */
++#define RSUSB_VID_INTEL 0x8086u
++#define RSUSB_VID_REALSENSE 0x38E5u
++
++/* Control requests accepted (class request, interface recipient) */
++#define RSUSB_RT_CLASS_IF_OUT 0x21u
++#define RSUSB_RT_CLASS_IF_IN 0xA1u
++
++/* DFU interface (exempt from the HWM filter) */
++#define RSUSB_CLASS_APP_SPECIFIC 0xFEu
++#define RSUSB_SUBCLASS_DFU 0x01u
++
++/* HWM packet (src/hw-monitor.cpp fill_usb_buffer): u16 length, bytes 2..3 magic AB CD, bytes 4..7 opcode (only byte 4
++ * is compared), bytes 8..11 param1, 12..15 param2 (uint32 LE). Checked on every 0x21 OUT control transfer except to a
++ * DFU interface, and on every bulk/interrupt OUT (DESIGN 3.5). A denied packet is answered with RSUSB_ST_ACCESS. */
++#define RSUSB_HWM_MIN_LEN 5u
++#define RSUSB_HWM_MAGIC_0 0xABu
++#define RSUSB_HWM_MAGIC_1 0xCDu
++#define RSUSB_HWM_OPCODE_OFFSET 4u
++#define RSUSB_HWM_PARAM1_OFFSET 8u
++#define RSUSB_HWM_PARAM2_OFFSET 12u
++#define RSUSB_HWM_XU_UNIT 3u        /* depth XU (src/ds/ds-private.h depth_xu) = HIBYTE(wIndex) */
++#define RSUSB_HWM_XU_SELECTOR 1u    /* DS5_HWMONITOR = HIBYTE(wValue) */
++#define RSUSB_HWM_OP_FWB 0x0Au      /* write flash bytes: param1 offset, param2 size (ProtectedFlashRanges only) */
++#define RSUSB_HWM_OP_FES 0x0Bu      /* erase flash sectors: param1 sector, param2 count (ProtectedFlashRanges only) */
++#define RSUSB_HWM_OP_FEF 0x0Cu      /* erase full flash: always denied */
++#define RSUSB_HWM_OP_FSRU 0x0Du     /* flash status register unlock, never sent by librealsense: always denied */
++#define RSUSB_HWM_OP_FPLOCK 0x0Eu   /* permanent flash lock: always denied */
++#define RSUSB_FLASH_SECTOR_SIZE 0x1000u
++
++/* Descriptor sizes on the wire */
++#define RSUSB_DEVICE_DESC_LEN 18u
++#define RSUSB_INTERFACE_DESC_LEN 9u
++#define RSUSB_ENDPOINT_WIRE_LEN 7u
++
++/* Limits (daemon enforces, client validates replies against them) */
++#define RSUSB_MAX_BUILD_LEN 128u
++#define RSUSB_MAX_DEVICES 32u
++#define RSUSB_MAX_PATH_LEN 64u
++#define RSUSB_MAX_INTERFACES 32u               /* per configuration (libusb USB_MAXINTERFACES) */
++#define RSUSB_MAX_ALTSETTINGS 128u             /* libusb USB_MAXALTSETTING */
++#define RSUSB_MAX_EXTRA_LEN 65535u             /* per altsetting; a configuration's wire bytes also <= its wTotalLength */
++#define RSUSB_MAX_ENDPOINTS 32u
++#define RSUSB_MAX_CONTROL_LEN 4096u
++#define RSUSB_MAX_BULK_LEN 65536u
++#define RSUSB_MAX_REQUEST_LEN (16u * 1024u * 1024u)
++#define RSUSB_MAX_TIMEOUT_MS 10000u            /* to == 0 or larger is clamped to this */
++
++/* Admission and quotas (DESIGN 3.6). Per-client limits are the per-device value times max(1, devices leased by the
++ * connection); global limits bound the daemon. */
++#define RSUSB_MAX_CLIENTS 16u                  /* READY connections */
++#define RSUSB_MAX_NEW_PER_UID 4u               /* connections without HELLO, per euid */
++#define RSUSB_NEW_TIMEOUT_MS 1000u             /* connection without HELLO is cancelled after this */
++#define RSUSB_QUOTA_HANDLES_PER_DEVICE 16u
++#define RSUSB_QUOTA_REQUESTS_PER_DEVICE 32u
++#define RSUSB_QUOTA_SYNC_PER_DEVICE 16u        /* CONTROL + BULK + RESET_EP in progress */
++#define RSUSB_QUOTA_SHM_PER_DEVICE (64ull * 1024u * 1024u)
++#define RSUSB_QUOTA_INFLIGHT_PER_DEVICE (32ull * 1024u * 1024u)   /* request bytes submitted, not completed */
++#define RSUSB_MAX_SHM_TOTAL (2048ull * 1024u * 1024u)             /* also <= physical memory / 8 */
++#define RSUSB_MAX_INFLIGHT_TOTAL (512ull * 1024u * 1024u)         /* wired by IOKit while in flight */
++#define RSUSB_BARRIER_EVERY 256u               /* daemon sends: xpc_connection_send_barrier every N messages */
++#define RSUSB_MAX_UNACKED_SENDS 4096u          /* more outstanding (barrier not run) -> connection cancelled */
++#define RSUSB_BARRIER_STALL_MS 5000u           /* a barrier pending longer -> connection cancelled */
++
++/* Timing */
++#define RSUSB_HELLO_TIMEOUT_MS 5000u
++#define RSUSB_CALL_TIMEOUT_MS 3000u            /* ENUMERATE, LEASE, REQ_CREATE, REQ_SUBMIT, REQ_CANCEL */
++#define RSUSB_DEVICE_CALL_TIMEOUT_MS 20000u    /* OPEN, CLOSE, RESET_EP */
++#define RSUSB_REPLY_MARGIN_MS 2000u            /* CONTROL / BULK: clamped `to` + margin */
++#define RSUSB_WATCHDOG_MS 15000u               /* daemon: a device call or CLOSE wait longer than this -> device lost */
++#define RSUSB_LOSS_HIDE_MS 3000u               /* client: POLLING_DEVICES_INTERVAL_MS + 1000 (DESIGN 4.7.5) */
++
++#endif
+diff --git a/src/libusb/enumerator-libusb.cpp b/src/libusb/enumerator-libusb.cpp
+index a7fc45dd4..f6b51acc5 100644
+--- a/src/libusb/enumerator-libusb.cpp
++++ b/src/libusb/enumerator-libusb.cpp
+@@ -7,6 +7,9 @@
+ #include "types.h"
+ 
+ #include "libusb.h"
++#ifdef __APPLE__
++#include "broker/broker-connection.h"
++#endif
+ 
+ namespace librealsense
+ {
+@@ -79,6 +82,10 @@ namespace librealsense
+ 
+         std::vector<usb_device_info> usb_enumerator::query_devices_info()
+         {
++#ifdef __APPLE__
++            if( auto broker = usb_broker::instance() )
++                return broker->query_devices_info();
++#endif
+             std::vector<usb_device_info> rv;
+             auto ctx = std::make_shared<usb_context>();
+ 
+@@ -104,6 +111,10 @@ namespace librealsense
+ 
+         rs_usb_device usb_enumerator::create_usb_device(const usb_device_info& info)
+         {
++#ifdef __APPLE__
++            if( auto broker = usb_broker::instance() )
++                return broker->create_usb_device( info );
++#endif
+             auto ctx = std::make_shared<usb_context>();
+ 
+             for (uint8_t idx = 0; idx < ctx->device_count(); ++idx)
