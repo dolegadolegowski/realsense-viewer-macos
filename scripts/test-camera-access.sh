@@ -97,6 +97,12 @@ check "binary mode 755" test "$(mode "$B")" = 755
 check "binary has no xattrs (except com.apple.provenance)" test -z "$(xattr "$B" | grep -v '^com.apple.provenance$')"
 check "daemon plist has no xattrs (except com.apple.provenance)" test -z "$(xattr "$D" | grep -v '^com.apple.provenance$')"
 check "no leftover tmp binary" test -z "$(find "$P1/Library/PrivilegedHelperTools" -name ".$LABEL.tmp.*")"
+T1="$P1/Library/PrivilegedHelperTools/$LABEL-allowlist.sh"
+check "list tool installed byte-identical" cmp -s "$LISTTOOL" "$T1"
+check "list tool mode 755" test "$(mode "$T1")" = 755
+check "list tool has no xattrs (except com.apple.provenance)" test -z "$(xattr "$T1" | grep -v '^com.apple.provenance$')"
+check "no temporary file left in PrivilegedHelperTools" test -z "$(find "$P1/Library/PrivilegedHelperTools" -name '.*')"
+check "no usbd.d created by the installer" test ! -e "$(dirname "$C")/usbd.d"
 check "config dir mode 755" test "$(mode "$(dirname "$C")")" = 755
 check "usbd.plist mode 644" test "$(mode "$C")" = 644
 check "daemon plist mode 644" test "$(mode "$D")" = 644
@@ -428,6 +434,59 @@ run_tool "$W/r.log" --dry-run --root "$LT" --remove "$NAME"
 check "list tool: install lock held -> refused" grep -q "another install/uninstall is running" "$W/r.log"
 rmdir "$LT/var/run/$LABEL.install.lock"
 
+# Installer and uninstaller with lists of other apps (DESIGN 6.3 step 7, 6.5)
+run_tool "$W/r.log" --dry-run --root "$LT" --add "$NAME" --source "$LS/list.plist"
+check "installer: a list to keep (rc $RC)" test -f "$XD/$NAME.plist"
+cp "$XD/$NAME.plist" "$W/keep.plist"
+chmod 775 "$XD"
+run_install "$W/k.log" --dry-run --root "$LT" --source "$SRCDIR"
+check "installer: reinstall with usbd.d (rc $RC)" test "$RC" = 0 -o "$RC" = 3
+check "installer: the list of another app survives byte-identical" cmp -s "$W/keep.plist" "$XD/$NAME.plist"
+check "installer: usbd.d 0775 -> 0755" test "$(mode "$XD")" = 755
+check "installer: reports the kept lists" grep -q "kept 1 list(s) of other apps (usbd.d)" "$W/k.log"
+no_line() { ! grep -q -- "$1" "$2"; }
+check "installer: no capacity warning" no_line "will skip" "$W/k.log"
+plutil -replace BuildNumber -integer 209912312359 "$LT/Library/Application Support/RealSense Viewer/usbd.plist"
+run_install "$W/k.log" --dry-run --root "$LT" --source "$SRCDIR" --allow-downgrade
+check "installer: a downgrade keeps the list too" cmp -s "$W/keep.plist" "$XD/$NAME.plist"
+# shellcheck disable=SC2046
+make_list "$XD/a.many.plist" a.many 1 $(hashes 64 5)
+# shellcheck disable=SC2046
+make_list "$XD/b.many.plist" b.many 1 $(hashes 64 6)
+# shellcheck disable=SC2046
+make_list "$XD/c.many.plist" c.many 1 $(hashes 64 7)
+# shellcheck disable=SC2046
+make_list "$XD/d.many.plist" d.many 1 $(hashes 64 8)
+run_install "$W/k.log" --dry-run --root "$LT" --source "$SRCDIR"
+check "installer: warns when the lists exceed 256 code hashes (rc $RC)" grep -q "the daemon will skip some lists of other apps" "$W/k.log"
+check "installer: the warning is not a failure" test "$RC" = 0 -o "$RC" = 3
+rm -f "$XD"/?.many.plist
+mv "$XD" "$W/xd-real"
+ln -s "$W/xd-real" "$XD"
+run_install "$W/k.log" --dry-run --root "$LT" --source "$SRCDIR"
+check "installer: a symlinked usbd.d is removed (rc $RC)" test ! -e "$XD" -a ! -L "$XD"
+check "installer: ... with a note" grep -q "usbd.d: not a directory" "$W/k.log"
+check "installer: ... and its target is not touched" cmp -s "$W/keep.plist" "$W/xd-real/$NAME.plist"
+LONE="$W/src/lone"
+mkdir -p "$LONE"
+cp "$INSTALL" "$LONE/install-camera-access.sh"
+RC=0
+"$LONE/install-camera-access.sh" --dry-run --root "$W/root8" --source "$SRCDIR" >"$W/k.log" 2>&1 || RC=$?
+check "installer: without the list tool next to it -> exit 1 (rc $RC)" test "$RC" = 1
+check "installer: ... says why" grep -q "camera-access-allowlist.sh is missing next to the installer" "$W/k.log"
+run_tool "$W/r.log" --dry-run --root "$LT" --add "$NAME" --source "$LS/list.plist"
+touch "$XD/.$NAME.plist.tmp.5" "$LT/Library/PrivilegedHelperTools/.$LABEL-allowlist.sh.tmp.7"
+RC=0
+"$UNINSTALL" --dry-run --root "$LT" >"$W/un-lt.log" 2>&1 || RC=$?
+check "uninstall with lists (rc $RC)" test "$RC" = 0 -o "$RC" = 3
+check "uninstall: removed usbd.d with its dot files" test ! -e "$XD"
+check "uninstall: reports the removed lists" grep -q "removed 1 list(s) of other apps" "$W/un-lt.log"
+check "uninstall: removed the list tool" test ! -e "$LT/Library/PrivilegedHelperTools/$LABEL-allowlist.sh"
+check "uninstall: removed the temporary list tool" test ! -e "$LT/Library/PrivilegedHelperTools/.$LABEL-allowlist.sh.tmp.7"
+check "uninstall: removed the config dir" test ! -e "$LT/Library/Application Support/RealSense Viewer"
+run_tool "$W/r.log" --dry-run --root "$LT" --add "$NAME" --source "$LS/list.plist"
+check "list tool after uninstall: camera access not installed" grep -q "is not installed on this Mac" "$W/r.log"
+
 # Uninstall
 mkdir -p "$P1/var/run/$LABEL" "$P1/private/var/tmp/rs-usbd.leftover"
 touch "$P1/Library/PrivilegedHelperTools/.$LABEL.tmp.123" "$P1/Library/PrivilegedHelperTools/other-helper"
@@ -435,6 +494,7 @@ RC=0
 "$UNINSTALL" --dry-run --root "$P1" >"$W/un.log" 2>&1 || RC=$?
 check "uninstall exit 0 or 3 (rc $RC)" test "$RC" = 0 -o "$RC" = 3
 check "uninstall removed binary" test ! -e "$B"
+check "uninstall removed the list tool" test ! -e "$T1"
 check "uninstall removed daemon plist" test ! -e "$D"
 check "uninstall removed config and its dir" test ! -e "$(dirname "$C")"
 check "uninstall removed tmp binary" test ! -e "$P1/Library/PrivilegedHelperTools/.$LABEL.tmp.123"

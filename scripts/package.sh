@@ -4,8 +4,8 @@
 #   dist/RealSense Depth Quality Tool.app
 #   dist/RealSense Tools/          command line tools (rs-enumerate-devices, rs-fw-update, ...) and camera-access/
 #   dist/RealSense-Viewer-<version>-macOS-arm64.dmg
-# Every app and the Tools folder carry the USB broker realsense-usbd, its installer and the allowlist of this build
-# (macos/broker/DESIGN.md 8.2, 8.3).
+# Every app and the Tools folder carry the USB broker realsense-usbd, its installer, uninstaller and list tool and
+# the allowlist of this build (macos/broker/DESIGN.md 8.2, 8.3).
 #
 #   CLIENT_RUNTIME=1 scripts/package.sh   signs the viewer and the Depth Quality Tool with the hardened runtime
 #                                         (DESIGN 3.7.4; only after the HW-3 soak passed with it)
@@ -39,7 +39,7 @@ BROKER_TOOLS=(rs-macos-selftest rs-macos-usbdump rs-enumerate-devices rs-fw-upda
               rs-record rs-on-chip-calib rs-benchmark rs-hello-realsense rs-capture rs-depth rs-color rs-infrared
               rs-motion rs-pointcloud rs-align rs-align-advanced rs-multicam rs-measure rs-post-processing
               rs-record-playback rs-save-to-disk rs-sensor-control rs-distance rs-callback rs-hdr)
-BROKER_SCRIPTS=(install-camera-access.sh uninstall-camera-access.sh)
+BROKER_SCRIPTS=(install-camera-access.sh uninstall-camera-access.sh camera-access-allowlist.sh)
 
 # cdhash_of <Mach-O>: the arm64 code directory hash the daemon admits (40 lowercase hex)
 cdhash_of() {
@@ -211,6 +211,9 @@ Afterwards no sudo and no password are needed, e.g.:
 The apps and these tools must come from the same DMG: camera access only admits the programs of the build it
 was installed from. Installing camera access from a newer DMG replaces it; then update the apps as well.
 To remove it:  sudo "./camera-access/uninstall-camera-access.sh"
+
+Other apps (e.g. IntelFaceScan) can be given camera access by an administrator with camera-access-allowlist.sh;
+they ask for it themselves. Updating camera access keeps their lists, removing it removes them too.
 
 Without camera access
 ---------------------

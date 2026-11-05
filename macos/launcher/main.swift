@@ -32,6 +32,7 @@ let releaseTool = macosDir.appendingPathComponent("rs-macos-release").path
 let handbackTool = macosDir.appendingPathComponent("rs-macos-handback").path
 let daemonTool = macosDir.appendingPathComponent("realsense-usbd").path
 let installScript = brokerResources.appendingPathComponent("install-camera-access.sh").path
+let listToolScript = brokerResources.appendingPathComponent("camera-access-allowlist.sh").path   // the installer needs it
 let bundledAllowlist = brokerResources.appendingPathComponent("allowlist.plist").path
 let daemonLabel = "io.github.dolegadolegowski.realsense-usbd"
 let installedDaemonPlist = "/Library/LaunchDaemons/\(daemonLabel).plist"
@@ -207,7 +208,8 @@ func isTrusted(_ path: String, file: Bool) -> Bool {
 
 func bundleIsTrusted() -> Bool {
     return isTrusted(bundleURL.path, file: false) && isTrusted(daemonTool, file: true)
-        && isTrusted(installScript, file: true) && isTrusted(bundledAllowlist, file: true)
+        && isTrusted(installScript, file: true) && isTrusted(listToolScript, file: true)
+        && isTrusted(bundledAllowlist, file: true)
 }
 
 struct BuildInfo {

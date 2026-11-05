@@ -4,7 +4,8 @@ export PATH=/usr/bin:/bin:/usr/sbin:/sbin
 umask 022
 set -euo pipefail
 
-# Removes camera access (the realsense-usbd LaunchDaemon) and hands every camera it captured back to macOS.
+# Removes camera access (the realsense-usbd LaunchDaemon) and hands every camera it captured back to macOS. It also
+# removes the lists of other apps (usbd.d) and the list tool, so camera access is withdrawn from every app.
 # Afterwards the apps ask for an administrator password at every launch again. Spec: macos/broker/DESIGN.md 6.5.
 #
 #   sudo uninstall-camera-access.sh
@@ -46,6 +47,8 @@ fi
 HELPER_DIR="$PREFIX/Library/PrivilegedHelperTools"
 BIN="$HELPER_DIR/$LABEL"
 CONF_DIR="$PREFIX/Library/Application Support/RealSense Viewer"
+EXTRA_DIR="$CONF_DIR/usbd.d"
+LIST_TOOL="$HELPER_DIR/$LABEL-allowlist.sh"
 DAEMON_PLIST="$PREFIX/Library/LaunchDaemons/$LABEL.plist"
 STATE_DIR="$PREFIX/var/run/$LABEL"
 LOCK="$PREFIX/var/run/$LABEL.install.lock"
@@ -133,11 +136,22 @@ if [ "$DRY" = 0 ]; then
     fi
 fi
 
-rm -f -- "$DAEMON_PLIST" "$BIN"
+rm -f -- "$DAEMON_PLIST" "$BIN" "$LIST_TOOL"
 if [ -d "$HELPER_DIR" ] && [ ! -L "$HELPER_DIR" ]; then
-    find "$HELPER_DIR" -maxdepth 1 -name ".$LABEL.tmp.*" -exec rm -f -- {} +
+    find "$HELPER_DIR" -maxdepth 1 -name ".$LABEL*.tmp.*" -exec rm -f -- {} +
 fi
 if [ -d "$CONF_DIR" ] && [ ! -L "$CONF_DIR" ]; then
+    # the lists of other apps: uninstalling camera access withdraws it from every app
+    if [ -L "$EXTRA_DIR" ] || { [ -e "$EXTRA_DIR" ] && [ ! -d "$EXTRA_DIR" ]; }; then
+        rm -f -- "$EXTRA_DIR"
+    elif [ -d "$EXTRA_DIR" ]; then
+        lists=0
+        for f in "$EXTRA_DIR"/*.plist; do
+            if [ -f "$f" ] && [ ! -L "$f" ]; then lists=$((lists + 1)); fi
+        done
+        rm -rf -- "$EXTRA_DIR"
+        note "removed $lists list(s) of other apps"
+    fi
     rm -f -- "$CONF_DIR/usbd.plist"
     rmdir -- "$CONF_DIR" 2>/dev/null || true
 fi

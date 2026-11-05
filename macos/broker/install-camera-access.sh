@@ -6,7 +6,9 @@ set -euo pipefail
 
 # Installs camera access for all users of this Mac: the RealSense USB broker realsense-usbd as a root
 # LaunchDaemon. Afterwards RealSense Viewer, the Depth Quality Tool and the allowlisted command line tools of the
-# same DMG use the camera without an administrator password, also on standard accounts.
+# same DMG use the camera without an administrator password, also on standard accounts. Install replaces the
+# viewer's own allowlist (one build at a time); the lists of other apps in usbd.d are kept. It also installs
+# camera-access-allowlist.sh (from next to this script), with which an administrator adds those lists.
 # Spec: macos/broker/DESIGN.md section 6.
 #
 #   sudo install-camera-access.sh --source <dir> [--source <dir>] [--allow-downgrade]
@@ -57,6 +59,8 @@ HELPER_DIR="$PREFIX/Library/PrivilegedHelperTools"
 BIN="$HELPER_DIR/$LABEL"
 CONF_DIR="$PREFIX/Library/Application Support/RealSense Viewer"
 CONF="$CONF_DIR/usbd.plist"
+EXTRA_DIR="$CONF_DIR/usbd.d"
+LIST_TOOL="$HELPER_DIR/$LABEL-allowlist.sh"
 DAEMON_PLIST="$PREFIX/Library/LaunchDaemons/$LABEL.plist"
 LOCK="$PREFIX/var/run/$LABEL.install.lock"
 TMPBASE="$PREFIX/private/var/tmp"
@@ -67,9 +71,11 @@ fi
 LOCKED=0
 STAGE=
 TMPBIN=
+TMPTOOL=
 # shellcheck disable=SC2329  # run by the EXIT trap
 cleanup() {
     if [ -n "$TMPBIN" ]; then rm -f -- "$TMPBIN"; fi
+    if [ -n "$TMPTOOL" ]; then rm -f -- "$TMPTOOL"; fi
     if [ -n "$STAGE" ]; then rm -rf -- "$STAGE"; fi
     if [ "$LOCKED" = 1 ]; then rmdir -- "$LOCK" 2>/dev/null || true; fi
 }
@@ -161,8 +167,12 @@ trust_path() {
     done
 }
 
-# 1. The script itself and every source
+# 1. The script itself, the list tool next to it, and every source
 trust_path "$0" file
+SELF_DIR="$(dirname -- "$(/bin/realpath -- "$0")")" || die "cannot resolve $0"
+SRC_TOOL="$SELF_DIR/camera-access-allowlist.sh"
+[ -e "$SRC_TOOL" ] || [ -L "$SRC_TOOL" ] || die "camera-access-allowlist.sh is missing next to the installer"
+trust_path "$SRC_TOOL" file
 SRC_BIN=
 SRC_ALLOW=
 for dir in "${SOURCES[@]}"; do
@@ -187,8 +197,14 @@ done
 STAGE="$(mktemp -d "$TMPBASE/rs-usbd.XXXXXX")"
 ditto --noextattr --noqtn "$SRC_BIN" "$STAGE/realsense-usbd"
 ditto --noextattr --noqtn "$SRC_ALLOW" "$STAGE/allowlist.plist"
+ditto --noextattr --noqtn "$SRC_TOOL" "$STAGE/camera-access-allowlist.sh"
 S_BIN="$STAGE/realsense-usbd"
 S_ALLOW="$STAGE/allowlist.plist"
+S_TOOL="$STAGE/camera-access-allowlist.sh"
+if ! { [ -f "$S_TOOL" ] && [ ! -L "$S_TOOL" ] && [ "$(stat -f %z "$S_TOOL")" -le 262144 ] \
+    && [ "$(head -n 1 "$S_TOOL")" = "#!/bin/bash -p" ] && /bin/bash -n "$S_TOOL"; }; then
+    die "camera-access-allowlist.sh is not a valid script"
+fi
 [ -f "$S_BIN" ] && [ ! -L "$S_BIN" ] && [ -f "$S_ALLOW" ] && [ ! -L "$S_ALLOW" ] || die "staged copies are not regular files"
 [ "$(stat -f %z "$S_BIN")" -le 16777216 ] || die "realsense-usbd is larger than 16 MiB"
 [ "$(stat -f %z "$S_ALLOW")" -le 65536 ] || die "allowlist.plist is larger than 64 KiB"
@@ -272,6 +288,13 @@ xattr -c "$TMPBIN"
 mv -f -- "$TMPBIN" "$BIN"
 TMPBIN=
 
+# 6b. The list tool other apps use to add their lists (DESIGN 6.7), at a fixed root-only path
+TMPTOOL="$HELPER_DIR/.$LABEL-allowlist.sh.tmp.$$"
+install ${OWNER[@]+"${OWNER[@]}"} -m 755 "$S_TOOL" "$TMPTOOL"
+xattr -c "$TMPTOOL"
+mv -f -- "$TMPTOOL" "$LIST_TOOL"
+TMPTOOL=
+
 # 7. Configuration from the validated values only
 if [ -L "$CONF_DIR" ] || { [ -e "$CONF_DIR" ] && [ ! -d "$CONF_DIR" ]; }; then
     rm -f -- "$CONF_DIR"
@@ -279,6 +302,27 @@ fi
 mkdir -p -- "$CONF_DIR"
 if [ "$DRY" = 0 ]; then chown root:wheel "$CONF_DIR"; fi
 chmod 755 "$CONF_DIR"
+# The lists of other apps (usbd.d) are kept across install, update and downgrade; only the directory is normalized
+if [ -L "$EXTRA_DIR" ] || { [ -e "$EXTRA_DIR" ] && [ ! -d "$EXTRA_DIR" ]; }; then
+    rm -f -- "$EXTRA_DIR"
+    note "removed $EXTRA_DIR: not a directory (the daemon ignores it)"
+fi
+if [ -d "$EXTRA_DIR" ]; then
+    if [ "$DRY" = 0 ]; then chown root:wheel "$EXTRA_DIR"; fi
+    chmod 755 "$EXTRA_DIR"
+    kept=0
+    extra_hashes=0
+    for f in "$EXTRA_DIR"/*.plist; do
+        [ -f "$f" ] && [ ! -L "$f" ] || continue
+        kept=$((kept + 1))
+        n="$(pl_get AllowedCDHashes array "$f" || true)"
+        if [[ "$n" =~ ^[0-9]{1,3}$ ]]; then extra_hashes=$((extra_hashes + n)); fi
+    done
+    note "kept $kept list(s) of other apps (usbd.d)"
+    if [ $((COUNT + extra_hashes)) -gt 256 ]; then
+        echo "$ME: warning: with this build's $COUNT code hashes the lists of other apps exceed 256; the daemon will skip some lists of other apps; see its log" >&2
+    fi
+fi
 NEW_CONF="$STAGE/usbd.plist"
 plutil -create xml1 "$NEW_CONF"
 plutil -insert Version -integer 1 "$NEW_CONF"
@@ -395,6 +439,7 @@ for ((i = 0; i < 20; i++)); do
     if probe="$("$BIN" --probe 2>&1)"; then
         note "installed camera access build $BUILD_NUMBER ($probe)"
         note "  $BIN"
+        note "  $LIST_TOOL"
         note "  $CONF"
         note "  $DAEMON_PLIST"
         exit 0
