@@ -213,7 +213,7 @@ hashes_of() {
 
 # restart the daemon so it reads usbd.d again (DESIGN 5.5: read once per process)
 reload() {
-    local probe='' i
+    local probe='' end
     if [ "$DRY" = 1 ]; then
         note "dry run: launchctl and the probe skipped"
         return 0
@@ -225,10 +225,12 @@ reload() {
     note "restarting camera access; running RealSense programs reconnect"
     launchctl kickstart -k "system/$LABEL" >/dev/null 2>&1 || die "launchctl kickstart failed"
     root_file "$BIN" || die "the installed $BIN is missing or not owned by root"
-    for ((i = 0; i < 90; i++)); do
+    end=$((SECONDS + 45))   # a probe that gets no answer takes a few seconds itself
+    while :; do
         if probe="$("$BIN" --probe 2>&1)"; then
             return 0
         fi
+        [ "$SECONDS" -lt "$end" ] || break
         sleep 0.5
     done
     die "camera access did not come back: $probe"
