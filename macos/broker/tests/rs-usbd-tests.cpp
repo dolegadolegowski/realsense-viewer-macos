@@ -1487,6 +1487,238 @@ namespace
         CHECK( ! load_config( dir + "/big.plist", false, c, err ) );
     }
 
+    // usbd.d/<name>.plist (DESIGN 5.4) as XML; `hashes` = AllowedCDHashes, `extra` = more keys
+    std::string extra_plist( const std::string & name, const std::vector< std::string > & hashes, const std::string & extra = "",
+                             const std::string & build_number = "<integer>202611050000</integer>",
+                             const std::string & protocol = "<integer>1</integer>" )
+    {
+        std::string s = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>Version</key><integer>1</integer>"
+                        "<key>Name</key><string>" + name + "</string><key>BuildID</key><string>" + std::string( 64, 'e' )
+                      + "</string><key>BuildNumber</key>" + build_number + "<key>ProtocolVersion</key>" + protocol
+                      + "<key>AllowedCDHashes</key><array>";
+        for( auto & h : hashes )
+            s += "<string>" + h + "</string>";
+        return s + "</array>" + extra + "</dict></plist>";
+    }
+
+    std::string hash_n( unsigned n, char prefix = 'a' )   // distinct 40-hex hashes
+    {
+        char b[41];
+        snprintf( b, sizeof( b ), "%c%039x", prefix, n );
+        return b;
+    }
+
+    std::vector< std::string > hashes_n( unsigned count, char prefix, unsigned first = 0 )
+    {
+        std::vector< std::string > rv;
+        for( unsigned i = 0; i < count; ++i )
+            rv.push_back( hash_n( first + i, prefix ) );
+        return rv;
+    }
+
+    void write_file( const std::string & path, const std::string & text, mode_t mode = 0644 )
+    {
+        std::ofstream( path ) << text;
+        CHECK( chmod( path.c_str(), mode ) == 0 );
+    }
+
+    CASE( extra_list_parser )
+    {
+        auto parse = []( const std::string & s, const std::string & name, extra_list & l ) {
+            std::string err;
+            return parse_extra_list( reinterpret_cast< const uint8_t * >( s.data() ), s.size(), name, l, err );
+        };
+        const std::string n = "io.github.example.app";
+        std::vector< std::string > two = { hash_n( 1 ), hash_n( 2 ) };
+        extra_list l;
+        CHECK( parse( extra_plist( n, two ), n, l ) );
+        CHECK( l.name == n && l.build_number == 202611050000 && l.protocol == 1 && l.cdhashes == two );
+        // unknown keys and the administrator keys of usbd.plist are ignored (they are unknown keys here)
+        CHECK( parse( extra_plist( n, two, "<key>Unknown</key><string>x</string><key>HandBackGraceSeconds</key><integer>0</integer>"
+                                           "<key>DaemonCDHash</key><string>" + two[0] + "</string>" ), n, l ) );
+        // a list made for another protocol version parses (kept; the daemon flags it and its programs get AUTH_VERSION)
+        CHECK( parse( extra_plist( n, two, "", "<integer>1</integer>", "<integer>2</integer>" ), n, l ) && l.protocol == 2 );
+        CHECK( parse( extra_plist( n, two, "", "<integer>999999999999999999</integer>" ), n, l ) );
+        CHECK( parse( extra_plist( n, hashes_n( 64, 'b' ) ), n, l ) && l.cdhashes.size() == 64 );
+        std::string v2 = extra_plist( n, two );
+        v2.replace( v2.find( "<integer>1</integer>" ), 20, "<integer>2</integer>" );
+        CHECK( ! parse( v2, n, l ) );
+        CHECK( ! parse( extra_plist( n, two ), "io.github.other.app", l ) );   // Name mismatch
+        CHECK( ! parse( extra_plist( "Io.github.example.app", two ), "Io.github.example.app", l ) );   // not a list name
+        std::string bad_id = extra_plist( n, two );
+        bad_id.replace( bad_id.find( std::string( 64, 'e' ) ), 64, std::string( 63, 'e' ) );
+        CHECK( ! parse( bad_id, n, l ) );
+        std::string upper_id = extra_plist( n, two );
+        upper_id.replace( upper_id.find( std::string( 64, 'e' ) ), 64, std::string( 64, 'E' ) );
+        CHECK( ! parse( upper_id, n, l ) );
+        for( const char * bn : { "<integer>-1</integer>", "<real>5</real>", "<string>5</string>", "<integer>1000000000000000000</integer>" } )
+            CHECK( ! parse( extra_plist( n, two, "", bn ), n, l ) );
+        for( const char * pv : { "<integer>0</integer>", "<string>1</string>", "<integer>2147483648</integer>", "<true/>" } )
+            CHECK( ! parse( extra_plist( n, two, "", "<integer>1</integer>", pv ), n, l ) );
+        CHECK( ! parse( extra_plist( n, {} ), n, l ) );
+        CHECK( ! parse( extra_plist( n, hashes_n( 65, 'b' ) ), n, l ) );
+        CHECK( ! parse( extra_plist( n, { hash_n( 1 ), std::string( 40, 'A' ) } ), n, l ) );
+        CHECK( ! parse( extra_plist( n, { hash_n( 1 ), hash_n( 1 ) } ), n, l ) );   // duplicate
+        CHECK( ! parse( extra_plist( n, { hash_n( 1 ).substr( 0, 39 ) } ), n, l ) );
+        std::string not_string = extra_plist( n, two );
+        std::string second = "<string>" + two[1] + "</string>";
+        not_string.replace( not_string.find( second ), second.size(), "<integer>1</integer>" );
+        CHECK( ! parse( not_string, n, l ) );
+        std::string no_hashes = extra_plist( n, two );
+        no_hashes.replace( no_hashes.find( "<key>AllowedCDHashes</key>" ), 26, "<key>Other</key>" );
+        CHECK( ! parse( no_hashes, n, l ) );
+        CHECK( ! parse( "<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><array><string>x</string></array></plist>", n, l ) );
+        CHECK( ! parse( "not a plist", n, l ) );
+        CHECK( ! parse( "", n, l ) );
+    }
+
+    CASE( extra_list_names )
+    {
+        for( std::string ok : { "a.b", "io.github.x.y-z", "io.github.dolegadolegowski.intelfacescan", "0.9", "a-1.b2" } )
+            CHECK( valid_list_name( ok ) );
+        std::string hundred = std::string( 48, 'a' ) + "." + std::string( 51, 'b' );
+        CHECK_EQ( hundred.size(), 100 );
+        CHECK( valid_list_name( hundred ) );
+        for( std::string bad : { "x", "ab", "A.b", "a..b", "-a.b", "a.b-", "a/b.c", ".a.b", "a.b.", "a.-b", "a_b.c", "a b.c",
+                                 "a.b/..", "a.b\n" } )
+            CHECK( ! valid_list_name( bad ) );
+        CHECK( ! valid_list_name( hundred + "b" ) );
+        CHECK( ! valid_list_name( std::string( "a.b\0c", 5 ) ) );
+    }
+
+    CASE( extra_list_files )
+    {
+        std::string base = temp_dir(), dir = base + "/usbd.d", err;
+        std::vector< std::string > problems;
+        // absent directory: nothing, no problem
+        CHECK( load_extra_lists( dir, false, problems ).empty() && problems.empty() );
+        CHECK( mkdir( dir.c_str(), 0755 ) == 0 );
+        CHECK( chmod( dir.c_str(), 0755 ) == 0 );
+        write_file( dir + "/a.good.plist", extra_plist( "a.good", { hash_n( 1 ) } ) );
+        write_file( dir + "/z.good.plist", extra_plist( "z.good", { hash_n( 2 ) } ) );
+        // a group-writable directory: no lists, one problem
+        CHECK( chmod( dir.c_str(), 0775 ) == 0 );
+        CHECK( load_extra_lists( dir, false, problems ).empty() );
+        CHECK_EQ( problems.size(), 1 );
+        CHECK( problems[0] == "usbd.d: unsafe directory" );
+        CHECK( chmod( dir.c_str(), 0755 ) == 0 );
+        // root-owned required: the tester's directory is refused
+        problems.clear();
+        CHECK( load_extra_lists( dir, true, problems ).empty() && problems.size() == 1 );
+        // a symlinked directory is refused
+        CHECK( symlink( dir.c_str(), ( base + "/link.d" ).c_str() ) == 0 );
+        problems.clear();
+        CHECK( load_extra_lists( base + "/link.d", false, problems ).empty() && problems.size() == 1 );
+        // every bad entry is skipped with its own problem, the good ones (before and after them) stay
+        std::string outside = base + "/outside.plist";
+        write_file( outside, extra_plist( "h.hardlink", { hash_n( 3 ) } ) );
+        CHECK( link( outside.c_str(), ( dir + "/h.hardlink.plist" ).c_str() ) == 0 );
+        write_file( base + "/target.plist", extra_plist( "s.symlink", { hash_n( 4 ) } ) );
+        CHECK( symlink( ( base + "/target.plist" ).c_str(), ( dir + "/s.symlink.plist" ).c_str() ) == 0 );
+        write_file( dir + "/w.writable.plist", extra_plist( "w.writable", { hash_n( 5 ) } ), 0666 );
+        CHECK( mkdir( ( dir + "/d.subdir.plist" ).c_str(), 0755 ) == 0 );
+        CHECK( mkfifo( ( dir + "/f.fifo.plist" ).c_str(), 0644 ) == 0 );
+        write_file( dir + "/b.big.plist", extra_plist( "b.big", { hash_n( 6 ) }, "<key>Pad</key><string>" + std::string( 70000, 'x' ) + "</string>" ) );
+        write_file( dir + "/Bad.Name.plist", extra_plist( "Bad.Name", { hash_n( 7 ) } ) );
+        write_file( dir + "/x.plist.tmp", extra_plist( "x", { hash_n( 8 ) } ) );
+        write_file( dir + "/n.mismatch.plist", extra_plist( "n.other", { hash_n( 9 ) } ) );
+        write_file( dir + "/i.invalid.plist", "not a plist" );
+        write_file( dir + "/.foo.plist.tmp.1", "temporary file of the list tool" );
+        problems.clear();
+        alarm( 2 );   // a FIFO must not block the loader
+        auto lists = load_extra_lists( dir, false, problems );
+        alarm( 0 );
+        CHECK_EQ( lists.size(), 2 );
+        CHECK( lists[0].name == "a.good" && lists[1].name == "z.good" );
+        for( auto & p : problems )
+            CHECK( p.compare( 0, 7, "usbd.d/" ) == 0 );
+        auto has = [&]( const std::string & file, const std::string & why ) {
+            for( auto & p : problems )
+                if( p.compare( 0, 7 + file.size() + 2, "usbd.d/" + file + ": " ) == 0 && p.find( why ) != std::string::npos )
+                    return true;
+            return false;
+        };
+        CHECK( has( "h.hardlink.plist", "hard-linked" ) );
+        CHECK( has( "s.symlink.plist", "symlink" ) );
+        CHECK( has( "w.writable.plist", "writable" ) );
+        CHECK( has( "d.subdir.plist", "not a regular file" ) );
+        CHECK( has( "f.fifo.plist", "not a regular file" ) );
+        CHECK( has( "b.big.plist", "64 KiB" ) );
+        CHECK( has( "Bad.Name.plist", "name" ) );
+        CHECK( has( "x.plist.tmp", "name" ) );
+        CHECK( has( "n.mismatch.plist", "Name" ) );
+        CHECK( has( "i.invalid.plist", "invalid" ) );
+        CHECK_EQ( problems.size(), 10 );   // the dot file is skipped silently
+        // 17 valid lists: the first 16 by name are loaded, the 17th gets a problem
+        std::string many = base + "/many.d";
+        CHECK( mkdir( many.c_str(), 0755 ) == 0 );
+        CHECK( chmod( many.c_str(), 0755 ) == 0 );
+        for( unsigned i = 17; i >= 1; --i )
+        {
+            char n[32];
+            snprintf( n, sizeof( n ), "l%02u.example", i );
+            write_file( many + "/" + n + ".plist", extra_plist( n, { hash_n( i, 'c' ) } ) );
+        }
+        problems.clear();
+        lists = load_extra_lists( many, false, problems );
+        CHECK_EQ( lists.size(), MAX_EXTRA_LISTS );
+        CHECK( lists.front().name == "l01.example" && lists.back().name == "l16.example" );
+        CHECK_EQ( problems.size(), 1 );
+        CHECK( problems[0] == "usbd.d/l17.example.plist: more than 16 lists" );
+        // usbd.plist next to a usbd.d full of problems loads as before
+        std::string conf_text = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>Version</key><integer>1</integer>"
+                                "<key>BuildID</key><string>" + std::string( 64, 'f' ) + "</string><key>BuildNumber</key><integer>7</integer>"
+                                "<key>ProtocolVersion</key><integer>1</integer><key>AllowedCDHashes</key><array><string>" + hash_n( 1 )
+                              + "</string></array><key>DaemonCDHash</key><string>" + hash_n( 1 ) + "</string></dict></plist>";
+        CHECK( chmod( base.c_str(), 0755 ) == 0 );
+        write_file( base + "/usbd.plist", conf_text );
+        config c;
+        CHECK( load_config( base + "/usbd.plist", false, c, err ) );
+        CHECK( c.build_number == 7 && c.cdhashes.size() == 1 && c.extra_lists.empty() && c.admitted_cdhashes.empty() );
+    }
+
+    CASE( allowlist_merge )
+    {
+        auto list = []( const std::string & name, std::vector< std::string > h ) {
+            extra_list l;
+            l.name = name;
+            l.protocol = 1;
+            l.cdhashes = std::move( h );
+            return l;
+        };
+        std::vector< std::string > problems;
+        // no extras: exactly the own list, so the requirement string (cdhash_requirement of it) is byte-identical
+        config c = test_config();
+        c.cdhashes = { hash_n( 3 ), hash_n( 1 ), hash_n( 2 ) };
+        apply_extra_lists( c, {}, problems );
+        CHECK( c.admitted_cdhashes == c.cdhashes && c.extra_lists.empty() && problems.empty() );
+        // a hash shared with the own list or an earlier list is admitted once
+        apply_extra_lists( c, { list( "b.two", { hash_n( 1 ), hash_n( 9 ) } ), list( "a.one", { hash_n( 9 ), hash_n( 8 ) } ) }, problems );
+        CHECK( problems.empty() && c.extra_lists.size() == 2 && c.extra_lists[0].name == "a.one" );
+        CHECK( ( c.admitted_cdhashes == std::vector< std::string >{ hash_n( 3 ), hash_n( 1 ), hash_n( 2 ), hash_n( 9 ), hash_n( 8 ) } ) );
+        // own 200 + list A 40 + list B 20: B is skipped whole, A kept, the own list first
+        c.cdhashes = hashes_n( 200, 'a' );
+        apply_extra_lists( c, { list( "b.list", hashes_n( 20, 'b' ) ), list( "a.list", hashes_n( 40, 'c' ) ) }, problems );
+        CHECK_EQ( c.admitted_cdhashes.size(), 240 );
+        CHECK( std::equal( c.cdhashes.begin(), c.cdhashes.end(), c.admitted_cdhashes.begin() ) );
+        CHECK( c.extra_lists.size() == 1 && c.extra_lists[0].name == "a.list" );
+        CHECK_EQ( problems.size(), 1 );
+        CHECK( problems[0] == "usbd.d/b.list.plist: more than 256 code hashes together with the lists before it" );
+        // name order decides which one is skipped
+        problems.clear();
+        apply_extra_lists( c, { list( "a.list", hashes_n( 20, 'b' ) ), list( "b.list", hashes_n( 40, 'c' ) ) }, problems );
+        CHECK( c.extra_lists.size() == 1 && c.extra_lists[0].name == "a.list" && c.admitted_cdhashes.size() == 220 );
+        CHECK( problems.size() == 1 && problems[0].find( "usbd.d/b.list.plist:" ) == 0 );
+        // exactly 256 are admitted; shared hashes do not count twice
+        problems.clear();
+        auto shared = hashes_n( 56, 'd' );
+        shared.push_back( c.cdhashes[0] );
+        apply_extra_lists( c, { list( "a.list", shared ) }, problems );
+        CHECK( problems.empty() && c.admitted_cdhashes.size() == MAX_ADMITTED_HASHES && c.extra_lists.size() == 1 );
+        apply_extra_lists( c, { list( "a.list", hashes_n( 57, 'd' ) ) }, problems );
+        CHECK( problems.size() == 1 && c.admitted_cdhashes == c.cdhashes && c.extra_lists.empty() );
+    }
+
     CASE( state_file_and_sweep_selection )
     {
         std::string root = temp_dir();

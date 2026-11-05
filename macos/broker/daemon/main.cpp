@@ -58,6 +58,22 @@ namespace
         std::string error;
         if( ! load_config( CONFIG_PATH, true, cfg, error ) )
             return refuse( ( "configuration: " + error ).c_str() );
+        // Lists of other projects (5.5): an invalid one is skipped, never stops the daemon
+        std::vector< std::string > problems;
+        apply_extra_lists( cfg, load_extra_lists( EXTRA_DIR, true, problems ), problems );
+        for( auto & pr : problems )
+            log_fault( "policy", "allowlist %{public}s skipped", pr.c_str() );
+        log_info( "policy", "allowlist usbd.plist: build %{public}lld, %{public}zu code hashes", (long long)cfg.build_number,
+                  cfg.cdhashes.size() );
+        for( auto & l : cfg.extra_lists )
+        {
+            log_info( "policy", "allowlist usbd.d/%{public}s: build %{public}lld, %{public}zu code hashes", l.name.c_str(),
+                      (long long)l.build_number, l.cdhashes.size() );
+            if( l.protocol != RSUSB_PROTOCOL_VERSION )
+                log_info( "policy", "allowlist usbd.d/%{public}s: made for protocol %{public}lld, its programs get AUTH_VERSION",
+                          l.name.c_str(), (long long)l.protocol );
+        }
+        log_info( "policy", "admitting %{public}zu code hashes", cfg.admitted_cdhashes.size() );
 
         paths p;
         state_store lock_store( p );
@@ -68,7 +84,7 @@ namespace
         if( ! backend->ok() )
             return refuse( "libusb_init failed" );
         macos_policy_options po;
-        po.cdhashes = cfg.cdhashes;
+        po.cdhashes = cfg.admitted_cdhashes;
         po.queue = dispatch_get_main_queue();
         auto * core = new usbd_core( std::move( backend ), std::make_unique< macos_policy >( po ), cfg, timing::from( cfg ), p );
         core->start( true );
