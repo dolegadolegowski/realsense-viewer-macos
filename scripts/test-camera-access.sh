@@ -198,6 +198,7 @@ trust_case "ACL entry allowing others to add files" "$AD: an ACL entry allows ot
 chmod -a "everyone allow add_file,delete_child" "$AD"
 chmod +a "everyone deny delete" "$AD"
 run_install "$W/t.log" --dry-run --root "$W/root4" --source "$AD"
+# shellcheck disable=SC2016  # $1 and $2 belong to the inner shell
 check "deny-only ACL accepted" bash -c '! grep -qF "$1: an ACL" "$2"' _ "$AD" "$W/t.log"
 chmod -N "$AD"
 HL="$W/src/hl"

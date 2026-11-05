@@ -67,6 +67,7 @@ fi
 LOCKED=0
 STAGE=
 TMPBIN=
+# shellcheck disable=SC2329  # run by the EXIT trap
 cleanup() {
     if [ -n "$TMPBIN" ]; then rm -f -- "$TMPBIN"; fi
     if [ -n "$STAGE" ]; then rm -rf -- "$STAGE"; fi
@@ -101,7 +102,7 @@ admin_uid() {
 }
 # A symlink in the given path would be re-resolved by every later use; refuse it instead of checking only its target
 no_symlink_in() {
-    local rest="$1" acc= part
+    local rest="$1" acc='' part
     case "$rest" in /*) ;; *) rest="$(pwd -P)/$rest" ;; esac
     while [ -n "$rest" ]; do
         part="${rest%%/*}"
