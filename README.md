@@ -117,6 +117,8 @@ against the allowlist, and writes:
 | `/Library/PrivilegedHelperTools/io.github.dolegadolegowski.realsense-usbd` | the daemon |
 | `/Library/LaunchDaemons/io.github.dolegadolegowski.realsense-usbd.plist` | its launchd job (started on demand, exits when idle) |
 | `/Library/Application Support/RealSense Viewer/usbd.plist` | allowlist of this build and optional administrator settings |
+| `/Library/Application Support/RealSense Viewer/usbd.d/<name>.plist` | allowlists of other apps (see below), each added once by an administrator, kept by updates |
+| `/Library/PrivilegedHelperTools/io.github.dolegadolegowski.realsense-usbd-allowlist.sh` | the tool other apps use to add their list |
 
 macOS then shows *"Background Items Added"*; the entry appears in *System Settings → General → Login Items &
 Extensions*. An administrator can switch it off there (the app then offers *Open Login Items settings*); a
@@ -129,11 +131,13 @@ not an SSH login.
 **Updates:** camera access admits exactly the programs of the DMG it was installed from (their code hashes).
 After installing the apps from a newer DMG the app offers **Update camera access** (an administrator again).
 Install the viewer, the Depth Quality Tool and the command line tools from the same DMG. Camera access is never
-silently downgraded: an older app reports that camera access is newer than the app.
+silently downgraded: an older app reports that camera access is newer than the app. An update keeps the lists of
+other apps.
 
 **Uninstall:** `sudo "/Applications/RealSense Viewer.app/Contents/Resources/realsense-usbd/uninstall-camera-access.sh"`
 (or the same script in `RealSense Tools/camera-access/`). It stops the daemon, gives every camera it captured back
-to macOS and removes the three files; the app then asks again at the next start.
+to macOS and removes its files; it also removes the lists of other apps and the list tool. The app then asks again
+at the next start.
 
 **Administrator settings** (optional keys in `usbd.plist`, kept by updates): `HandBackGraceSeconds` (0–600,
 default 5: how long a camera stays captured after the last program closed it), `IdleExitSeconds` (10–3600,
@@ -141,6 +145,35 @@ default 60), `DeniedHWMOpcodes` (array of hardware‑monitor opcodes to refuse) 
 of `{Start, Length}` flash byte ranges whose erase/write is refused). For D585S safety cameras, D500
 `SAFETY_PRESET_WRITE` (`0x95`) and `CALIBRESTOREEPROM` (`0xA8`) are candidates for `DeniedHWMOpcodes`. Restart the
 daemon after a change: `sudo launchctl kickstart -k system/io.github.dolegadolegowski.realsense-usbd`.
+
+### Camera access for other apps
+
+Other projects that use librealsense with the same broker client (patch `0002-macos-usb-broker.patch`), e.g.
+IntelFaceScan, can use camera access too: an administrator adds the app's own allowlist once, and from then on its
+programs use RealSense cameras without a password, for every user of the Mac, with the same rules as the viewer
+(only the user at the screen, only RealSense devices). Such apps offer an **Enable camera access for *app*** step
+themselves (an administrator's name and password, once per app version). Their lists live in
+`/Library/Application Support/RealSense Viewer/usbd.d/` next to the viewer's own `usbd.plist`, which they never
+change; updates of camera access keep them, uninstalling camera access removes them. At most 16 lists and 256
+programs in total (with the viewer's own) are admitted. This needs camera access installed from a build that has
+`camera-access-allowlist.sh` (release `v2.58.4-macos.3` does not); with an older one, update camera access first.
+Status: covered by host tests (the daemon's list handling against the mock backend, the real code-signing
+requirement in-process, the scripts' dry runs), not yet by the hardware checks.
+
+By hand (the app ships its list, e.g. in `Contents/Resources/camera-access/<name>.plist`; it must be in a folder
+only root or an administrator can change, such as `/Applications`):
+
+```bash
+sudo /bin/bash /Library/PrivilegedHelperTools/io.github.dolegadolegowski.realsense-usbd-allowlist.sh \
+    --add io.github.dolegadolegowski.intelfacescan \
+    --source "/Applications/IntelFaceScan.app/Contents/Resources/camera-access/io.github.dolegadolegowski.intelfacescan.plist"
+sudo /bin/bash /Library/PrivilegedHelperTools/io.github.dolegadolegowski.realsense-usbd-allowlist.sh \
+    --remove io.github.dolegadolegowski.intelfacescan
+```
+
+Adding or removing a list restarts the daemon, so RealSense programs that are running lose the camera for a moment
+and reconnect. The installed lists: `ls "/Library/Application Support/RealSense Viewer/usbd.d"`; the daemon also
+logs them when it starts (`allowlist usbd.d/<name>: ...`, and a fault line for every list it skips).
 
 ### Security model
 
@@ -164,14 +197,19 @@ daemon after a change: `sudo launchctl kickstart -k system/io.github.dolegadoleg
   (`build/Release`), are not allowlisted: they need sudo as before.
 * The installer only takes files from folders that only root/administrators can change, never from a
   translocated app, and generates the launchd job and settings itself instead of copying them.
+* Lists of other apps (`usbd.d`) widen the set of admitted programs with the same caveats (version pinning, not
+  code containment). Only root writes them, an administrator adds each one, and they can neither change the
+  daemon's settings nor displace the viewer's own list or stop the daemon from starting (invalid lists are skipped
+  and logged). The list tool applies the installer's checks to the app's list and writes only validated values.
 
 ### Privacy
 
 * Depth, infrared and RGB streamed through the daemon do **not** light up the macOS camera indicator and do not
   trigger the camera permission prompt: macOS does not see a camera being used, only a USB device. Privacy
   (PPPC) profiles cannot target it; only the `allowCamera` ban above is honoured.
-* The daemon logs to the unified log (subsystem `io.github.dolegadolegowski.realsense-usbd`): admitted and
-  rejected programs (pid, uid, path), camera capture and hand‑back, device arrival/removal, refused commands —
+* The daemon logs to the unified log (subsystem `io.github.dolegadolegowski.realsense-usbd`): admitted (with the
+  allowlist that admitted it: `usbd.plist` or the name of another app's list) and rejected programs (pid, uid,
+  path), camera capture and hand‑back, device arrival/removal, refused commands —
   never image data or command payloads. `log show --last 1h --predicate 'subsystem ==
   "io.github.dolegadolegowski.realsense-usbd"'` shows them.
 * Non‑RealSense webcams: the root path of the viewer also lists third‑party UVC webcams; through camera access
@@ -318,9 +356,10 @@ The GitHub Actions workflow (`.github/workflows/build.yml`, macOS 27 runner) bui
 (*Actions → build → Run workflow*), optionally attaching it to an existing release.
 
 The binaries in `build/Release` are not allowlisted for camera access; run them with `sudo`, or use the
-packaged apps and tools. `scripts/test-camera-access.sh` tests the camera access installer and uninstaller
-without root (dry runs into a temporary folder); `scripts/build.sh --asan|--tsan|--fuzz` adds sanitizer and
-fuzzer builds of the daemon tests.
+packaged apps and tools. `scripts/test-camera-access.sh` tests the camera access installer, uninstaller and list
+tool without root (dry runs into a temporary folder); `build/usbd/rs-usbd-tests` runs the daemon's host tests and
+`build/usbd/rs-usbd-testd --inprocess` its real code-signing checks without launchd or root;
+`scripts/build.sh --asan|--tsan|--fuzz` adds sanitizer and fuzzer builds of the daemon tests.
 
 `VIEWER_TESTS=ON scripts/build.sh` additionally builds `realsense-viewer-tests`, the upstream GUI test suite
 (ImGui Test Engine) that drives the real viewer UI: `sudo build/Release/realsense-viewer-tests --auto`.
