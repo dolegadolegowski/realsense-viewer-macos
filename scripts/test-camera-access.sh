@@ -1,6 +1,7 @@
 #!/bin/bash
-# H7 (macos/broker/DESIGN.md 9.1): host-only tests of install-camera-access.sh and uninstall-camera-access.sh in their
-# non-root --dry-run --root mode, with a fake ad-hoc signed daemon. Never needs root, never touches /Library.
+# H7 (macos/broker/DESIGN.md 9.1): host-only tests of install-camera-access.sh, uninstall-camera-access.sh and
+# camera-access-allowlist.sh in their non-root --dry-run --root mode, with a fake ad-hoc signed daemon. Never needs
+# root, never touches /Library.
 #
 #   scripts/test-camera-access.sh [work dir]     (default: a new temporary directory)
 set -euo pipefail
@@ -8,6 +9,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 INSTALL="$ROOT/macos/broker/install-camera-access.sh"
 UNINSTALL="$ROOT/macos/broker/uninstall-camera-access.sh"
+LISTTOOL="$ROOT/macos/broker/camera-access-allowlist.sh"
 LABEL=io.github.dolegadolegowski.realsense-usbd
 [ "$(id -u)" != 0 ] || { echo "run as a normal user" >&2; exit 1; }
 
@@ -24,15 +26,21 @@ ok() { PASS=$((PASS + 1)); echo "ok   $*"; }
 bad() { FAIL=$((FAIL + 1)); echo "FAIL $*"; }
 check() { local name="$1"; shift; if "$@"; then ok "$name"; else bad "$name"; fi; }
 
-for s in "$INSTALL" "$UNINSTALL"; do
+for s in "$INSTALL" "$UNINSTALL" "$LISTTOOL"; do
     check "bash -n $(basename "$s")" /bin/bash -n "$s"
     check "shebang $(basename "$s")" test "$(head -1 "$s")" = "#!/bin/bash -p"
 done
 if command -v shellcheck >/dev/null; then
-    check "shellcheck" shellcheck -s bash "$INSTALL" "$UNINSTALL" "$0"
+    check "shellcheck" shellcheck -s bash "$INSTALL" "$UNINSTALL" "$LISTTOOL" "$0"
 else
     echo "skip shellcheck (not installed)"
 fi
+# The trust rule (DESIGN 6.2) is the same code in the installer and the list tool
+fn_body() { sed -n "/^$1() {/,/^}/p" "$2"; }
+same_text() { [ -n "$1" ] && [ "$1" = "$2" ]; }
+for f in admin_uid no_symlink_in acl_allows_write trust_path; do
+    check "6.2 function $f identical in the list tool" same_text "$(fn_body "$f" "$INSTALL")" "$(fn_body "$f" "$LISTTOOL")"
+done
 
 # Fake daemon, signed like package.sh signs realsense-usbd
 SRCDIR="$W/src/camera-access"
@@ -249,6 +257,176 @@ mkdir -p "$W/root6/var/run/$LABEL.install.lock"
 run_install "$W/lock.log" --dry-run --root "$W/root6" --source "$SRCDIR"
 check "lock held -> refused" grep -q "another install/uninstall is running" "$W/lock.log"
 check "foreign lock not removed" test -d "$W/root6/var/run/$LABEL.install.lock"
+
+# List tool (DESIGN 6.7): lists of other apps in usbd.d, on a prefix with camera access installed (dry run)
+LT="$W/lt"
+run_install "$W/lt-install.log" --dry-run --root "$LT" --source "$SRCDIR"
+check "list tool: camera access installed in its prefix (rc $RC)" test "$RC" = 0 -o "$RC" = 3
+XD="$LT/Library/Application Support/RealSense Viewer/usbd.d"
+NAME=io.github.example.app
+H1=1111111111111111111111111111111111111111
+H2=2222222222222222222222222222222222222222
+# run_tool <log> <args...>: status in RC
+run_tool() { local log="$1"; shift; RC=0; "$LISTTOOL" "$@" >"$log" 2>&1 || RC=$?; }
+build_id() { printf '%s' "$(printf '%s\n' "$@" | LC_ALL=C sort -u)" | shasum -a 256 | cut -d' ' -f1; }
+# make_list <file> <name> <BuildNumber> <hash>...: a valid list (DESIGN 5.4)
+make_list() {
+    local f="$1" n="$2" bn="$3" h
+    shift 3
+    rm -f "$f"
+    plutil -create xml1 "$f"
+    plutil -insert Version -integer 1 "$f"
+    plutil -insert Name -string "$n" "$f"
+    plutil -insert BuildID -string "$(build_id "$@")" "$f"
+    plutil -insert BuildNumber -integer "$bn" "$f"
+    plutil -insert ProtocolVersion -integer 1 "$f"
+    plutil -insert AllowedCDHashes -array "$f"
+    for h in "$@"; do plutil -insert AllowedCDHashes -string "$h" -append "$f"; done
+    chmod 644 "$f"
+}
+hashes() {   # hashes <count> <prefix digit>: distinct 40-hex hashes
+    local i
+    for ((i = 0; i < $1; i++)); do printf '%s%039x\n' "$2" "$i"; done
+}
+LS="$W/src/lists"
+mkdir -p "$LS"
+make_list "$LS/list.plist" "$NAME" 202611050000 "$H2" "$H1"
+plutil -insert Evil -string x "$LS/list.plist"
+run_tool "$W/lt-add.log" --dry-run --root "$LT" --add "$NAME" --source "$LS/list.plist"
+check "list tool: --add (rc $RC)" test "$RC" = 0 -o "$RC" = 3
+check "list tool: --add reports what it enabled" grep -q "enabled $NAME (build 202611050000, 2 code hashes)" "$W/lt-add.log"
+check "list tool: usbd.d mode 755" test "$(mode "$XD")" = 755
+check "list tool: list mode 644" test "$(mode "$XD/$NAME.plist")" = 644
+EXPECT_L="{\"AllowedCDHashes\":[\"$H1\",\"$H2\"],\"BuildID\":\"$(build_id "$H1" "$H2")\",\"BuildNumber\":202611050000,\"Name\":\"$NAME\",\"ProtocolVersion\":1,\"Version\":1}"
+check "list tool: list = validated keys only, sorted hashes" test "$(canon "$XD/$NAME.plist")" = "$EXPECT_L"
+check "list tool: list has no xattrs (except com.apple.provenance)" test -z "$(xattr "$XD/$NAME.plist" | grep -v '^com.apple.provenance$')"
+check "list tool: no temporary file left" test -z "$(find "$XD" -name '.*')"
+check "list tool: no staging dir left" test -z "$(find "$LT/private/var/tmp" -mindepth 1)"
+check "list tool: no lock left" test ! -e "$LT/var/run/$LABEL.install.lock"
+check "list tool: usbd.plist untouched" test "$(canon "$LT/Library/Application Support/RealSense Viewer/usbd.plist")" = "$EXPECT_C"
+
+# refused contents (fatal in a dry run too)
+tool_refuses() {   # tool_refuses <name> <expected substring> <tool args...>
+    local name="$1" want="$2"
+    shift 2
+    run_tool "$W/r.log" --dry-run --root "$LT" "$@"
+    if [ "$RC" = 1 ] && grep -qF -- "$want" "$W/r.log"; then ok "list tool refuses: $name"; else bad "list tool refuses: $name (rc $RC)"; sed 's/^/    /' "$W/r.log"; fi
+}
+BL="$W/src/badlists"
+mkdir -p "$BL"
+tool_refuses "Name mismatch" "Name is not io.github.other.app" --add io.github.other.app --source "$LS/list.plist"
+for n in ../x A.b x io.github..x .a.b a.b- 'a b.c'; do
+    tool_refuses "bad name '$n'" "bad list name" --add "$n" --source "$LS/list.plist"
+done
+make_list "$BL/v2.plist" "$NAME" 1 "$H1"
+plutil -replace Version -integer 2 "$BL/v2.plist"
+tool_refuses "Version 2" "Version must be" --add "$NAME" --source "$BL/v2.plist"
+make_list "$BL/upper.plist" "$NAME" 1 "$H1" ABCDEF0123456789abcdef0123456789abcdef01
+tool_refuses "upper-case cdhash" "AllowedCDHashes must hold" --add "$NAME" --source "$BL/upper.plist"
+make_list "$BL/short.plist" "$NAME" 1 "$H1" 0123
+tool_refuses "short cdhash" "AllowedCDHashes must hold" --add "$NAME" --source "$BL/short.plist"
+# shellcheck disable=SC2046  # one word per hash
+make_list "$BL/65.plist" "$NAME" 1 $(hashes 65 3)
+tool_refuses "65 cdhashes" "AllowedCDHashes must hold" --add "$NAME" --source "$BL/65.plist"
+make_list "$BL/none.plist" "$NAME" 1 "$H1"
+plutil -replace AllowedCDHashes -json '[]' "$BL/none.plist"
+tool_refuses "no cdhash" "AllowedCDHashes must hold" --add "$NAME" --source "$BL/none.plist"
+make_list "$BL/dup.plist" "$NAME" 1 "$H1" "$H1"
+tool_refuses "duplicate cdhash" "twice" --add "$NAME" --source "$BL/dup.plist"
+make_list "$BL/bid.plist" "$NAME" 1 "$H1"
+plutil -replace BuildID -string "$(printf '%064d' 0)" "$BL/bid.plist"
+tool_refuses "BuildID mismatch" "BuildID does not match" --add "$NAME" --source "$BL/bid.plist"
+make_list "$BL/bn.plist" "$NAME" 1 "$H1"
+plutil -replace BuildNumber -string 1 "$BL/bn.plist"
+tool_refuses "BuildNumber as string" "BuildNumber must be" --add "$NAME" --source "$BL/bn.plist"
+make_list "$BL/pv.plist" "$NAME" 1 "$H1"
+plutil -replace ProtocolVersion -integer 2 "$BL/pv.plist"
+tool_refuses "other ProtocolVersion" "was made for camera access protocol 2, this Mac's camera access speaks 1" --add "$NAME" --source "$BL/pv.plist"
+make_list "$BL/big.plist" "$NAME" 1 "$H1"
+plutil -insert Pad -string "$(printf '%070000d' 0)" "$BL/big.plist"
+tool_refuses "list over 64 KiB" "larger than 64 KiB" --add "$NAME" --source "$BL/big.plist"
+printf 'not a plist' >"$BL/text.plist"
+tool_refuses "not a plist" "not a valid property list" --add "$NAME" --source "$BL/text.plist"
+check "list tool: refused lists left the enabled one alone" test "$(canon "$XD/$NAME.plist")" = "$EXPECT_L"
+
+# source trust (report-only in a dry run: exit 3 with the reason)
+tool_trust() {   # tool_trust <name> <expected substring> <tool args...>
+    local name="$1" want="$2"
+    shift 2
+    run_tool "$W/t.log" --dry-run --root "$LT" "$@"
+    if [ "$RC" = 3 ] && grep 'untrusted' "$W/t.log" | grep -qF -- "$want"; then ok "list tool trust: $name"; else bad "list tool trust: $name (rc $RC)"; sed 's/^/    /' "$W/t.log"; fi
+}
+ln -s "$LS/list.plist" "$BL/link.plist"
+tool_trust "symlinked source" "$BL/link.plist: not a regular file" --add "$NAME" --source "$BL/link.plist"
+ln "$LS/list.plist" "$BL/hard.plist"
+tool_trust "hard-linked source" "has 2 hard links" --add "$NAME" --source "$BL/hard.plist"
+rm -f "$BL/hard.plist"
+LWW="$W/src/lww"
+mkdir -p "$LWW"
+cp "$LS/list.plist" "$LWW/list.plist"
+chmod 777 "$LWW"
+tool_trust "world-writable source dir" "$LWW: world-writable" --add "$NAME" --source "$LWW/list.plist"
+chmod 755 "$LWW"
+LTR="$W/src/AppTranslocation/Y/d"
+mkdir -p "$LTR"
+cp "$LS/list.plist" "$LTR/list.plist"
+tool_trust "/AppTranslocation/ source" "translocated app" --add "$NAME" --source "$LTR/list.plist"
+
+# state
+mkdir -p "$W/lt-empty"
+run_tool "$W/r.log" --dry-run --root "$W/lt-empty" --add "$NAME" --source "$LS/list.plist"
+check "list tool: camera access not installed -> refused (rc $RC)" grep -q "is not installed on this Mac" "$W/r.log"
+check "list tool: nothing written without camera access" test ! -e "$W/lt-empty/Library/Application Support/RealSense Viewer/usbd.d"
+for ((i = 1; i <= 16; i++)); do
+    n="$(printf 'l%02d.example' "$i")"
+    make_list "$XD/$n.plist" "$n" 1 "$(printf '%s%039x' 4 "$i")"
+done
+tool_refuses "a 17th list" "camera access cannot admit more programs (17 lists" --add "$NAME" --source "$LS/list.plist"
+rm -f "$XD"/l*.example.plist
+# shellcheck disable=SC2046
+make_list "$XD/a.many.plist" a.many 1 $(hashes 64 5)
+# shellcheck disable=SC2046
+make_list "$XD/b.many.plist" b.many 1 $(hashes 64 6)
+# shellcheck disable=SC2046
+make_list "$XD/c.many.plist" c.many 1 $(hashes 64 7)
+# shellcheck disable=SC2046
+make_list "$XD/d.many.plist" d.many 1 $(hashes 60 8)
+run_tool "$W/r.log" --dry-run --root "$LT" --add "$NAME" --source "$LS/list.plist"
+check "list tool: exactly 256 code hashes accepted (rc $RC)" test "$RC" = 0 -o "$RC" = 3
+make_list "$BL/three.plist" "$NAME" 202611050000 "$H1" "$H2" 3333333333333333333333333333333333333333
+tool_refuses "more than 256 code hashes" "camera access cannot admit more programs (5 lists of at most 16, 257 code hashes" --add "$NAME" --source "$BL/three.plist"
+rm -f "$XD"/?.many.plist
+make_list "$BL/newer.plist" "$NAME" 209912312359 "$H1"
+run_tool "$W/r.log" --dry-run --root "$LT" --add "$NAME" --source "$BL/newer.plist"
+check "list tool: a newer build replaces the list (rc $RC)" test "$(plutil -extract BuildNumber raw "$XD/$NAME.plist")" = 209912312359
+tool_refuses "downgrade" "newer than this one (202611050000)" --add "$NAME" --source "$LS/list.plist"
+run_tool "$W/r.log" --dry-run --root "$LT" --add "$NAME" --source "$LS/list.plist" --allow-downgrade
+check "list tool: --allow-downgrade accepted (rc $RC)" test "$(canon "$XD/$NAME.plist")" = "$EXPECT_L"
+make_list "$XD/z.other.plist" z.other 1 "$H1"
+run_tool "$W/r.log" --dry-run --root "$LT" --remove "$NAME"
+check "list tool: --remove (rc $RC)" test "$RC" = 0 -o "$RC" = 3
+check "list tool: --remove deleted the list" test ! -e "$XD/$NAME.plist"
+check "list tool: --remove kept the other list" test -f "$XD/z.other.plist"
+run_tool "$W/r.log" --dry-run --root "$LT" --remove "$NAME"
+check "list tool: --remove of an absent list (rc $RC)" test "$RC" = 0 -o "$RC" = 3
+check "list tool: --remove of an absent list says so" grep -q "$NAME is not enabled" "$W/r.log"
+rm -f "$XD/z.other.plist"
+
+# arguments and modes
+run_tool "$W/r.log" --root "$LT" --remove "$NAME"
+check "list tool: --root without --dry-run refused" test "$RC" = 1 -a "$(grep -c 'only allowed with --dry-run' "$W/r.log")" = 1
+run_tool "$W/r.log" --remove "$NAME"
+check "list tool: real run as non-root refused" grep -q "run as root" "$W/r.log"
+for args in "" "--add $NAME" "--remove" "--remove $NAME --source $LS/list.plist" "--remove $NAME --allow-downgrade" \
+    "--add $NAME --remove $NAME --source $LS/list.plist" "--bogus"; do
+    # shellcheck disable=SC2086  # word splitting wanted
+    run_tool "$W/r.log" --dry-run --root "$LT" $args
+    check "list tool: usage error '$args' -> 2 (rc $RC)" test "$RC" = 2
+done
+mkdir -p "$LT/var/run/$LABEL.install.lock"
+run_tool "$W/r.log" --dry-run --root "$LT" --remove "$NAME"
+check "list tool: install lock held -> refused" grep -q "another install/uninstall is running" "$W/r.log"
+rmdir "$LT/var/run/$LABEL.install.lock"
 
 # Uninstall
 mkdir -p "$P1/var/run/$LABEL" "$P1/private/var/tmp/rs-usbd.leftover"
