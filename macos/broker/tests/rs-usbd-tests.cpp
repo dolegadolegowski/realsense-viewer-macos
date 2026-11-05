@@ -1719,6 +1719,51 @@ namespace
         CHECK( problems.size() == 1 && c.admitted_cdhashes == c.cdhashes && c.extra_lists.empty() );
     }
 
+    CASE( allowlist_attribution )
+    {
+        auto list = []( const std::string & name, std::vector< std::string > h ) {
+            extra_list l;
+            l.name = name;
+            l.protocol = 1;
+            l.cdhashes = std::move( h );
+            return l;
+        };
+        std::vector< std::string > problems;
+        config own = test_config();
+        apply_extra_lists( own, {}, problems );
+        CHECK( lists_admitting( own, own.cdhashes[0] ) == "usbd.plist" );
+        CHECK( lists_admitting( own, hash_n( 1 ) ).empty() );
+        config c = test_config();
+        apply_extra_lists( c, { list( "io.github.example.app", { hash_n( 1 ), c.cdhashes[0] } ), list( "b.second", { hash_n( 1 ) } ),
+                                list( "z.toolarge", hashes_n( 256, 'b' ) ) },
+                           problems );
+        CHECK_EQ( problems.size(), 1 );   // z.toolarge is skipped by the cap and admits nothing
+        CHECK( lists_admitting( c, c.cdhashes[0] ) == "usbd.plist, io.github.example.app" );
+        CHECK( lists_admitting( c, hash_n( 1 ) ) == "b.second, io.github.example.app" );
+        CHECK( lists_admitting( c, hash_n( 0, 'b' ) ).empty() );
+        CHECK( lists_admitting( c, "" ).empty() );
+        // the core asks the policy for the peer's cdhash once per admitted HELLO, never for a rejected one
+        env e( { "d455.plist" }, fast(), c );
+        e.pol->set_next_peer_cdhash( hash_n( 1 ) );
+        {
+            client a( e );
+            CHECK( wait_for( [&] { return e.pol->peer_cdhash_calls() == 1; } ) );
+        }
+        e.pol->set_next_peer( 502, true );
+        client other_user( e, false );
+        CHECK_EQ( other_user.hello(), RSUSB_AUTH_USER );
+        client old_protocol( e, false );
+        CHECK_EQ( old_protocol.hello( 99 ), RSUSB_AUTH_VERSION );
+        e.pol->set_camera_allowed( false, false );
+        client cam( e, false );
+        CHECK_EQ( cam.hello(), RSUSB_AUTH_CAMERA_DISABLED );
+        e.pol->set_camera_allowed( true, false );
+        client b( e );   // an admitted peer whose cdhash the policy cannot tell (logged as "an unknown list")
+        CHECK( wait_for( [&] { return e.pol->peer_cdhash_calls() == 2; } ) );
+        sleep_ms( 100 );
+        CHECK_EQ( e.pol->peer_cdhash_calls(), 2 );
+    }
+
     CASE( state_file_and_sweep_selection )
     {
         std::string root = temp_dir();

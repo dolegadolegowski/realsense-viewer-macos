@@ -788,7 +788,12 @@ namespace usbd
             }
             uint32_t sup = 0;
             if( auth == RSUSB_AUTH_OK )
-                log_info( "conn", "pid %{public}d uid %{public}d admitted (%{public}s)", c->pid, c->euid, c->path.c_str() );
+            {
+                std::string h = pol->peer_cdhash( m );
+                std::string by = h.empty() ? "" : lists_admitting( cfg, h );
+                log_info( "conn", "pid %{public}d uid %{public}d admitted by %{public}s (%{public}s)", c->pid, c->euid,
+                          by.empty() ? "an unknown list" : by.c_str(), c->path.c_str() );
+            }
             else if( log_rate( c->pid, "hello", sup ) )
                 log_info( "policy", "pid %{public}d uid %{public}d rejected at HELLO (auth %{public}d, %{public}s, %u suppressed)",
                           c->pid, c->euid, int( auth ), c->path.c_str(), sup );

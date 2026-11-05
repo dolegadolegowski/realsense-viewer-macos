@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <string>
 
 namespace usbd
 {
@@ -28,6 +29,9 @@ namespace usbd
         virtual uid_t peer_uid( xpc_connection_t peer ) = 0;
         virtual pid_t peer_pid( xpc_connection_t peer ) = 0;
         virtual rsusb_auth hello( xpc_connection_t peer ) = 0;   // user and camera checks (3.2.2, 3.2.5)
+        // cdhash (40 lowercase hex) of the process that sent `message`, "" if unknown. Diagnostics only (which list
+        // admitted a peer, 2.10): admission is decided by the code-signing requirement (3.2.1).
+        virtual std::string peer_cdhash( xpc_object_t /*message*/ ) { return {}; }
         virtual bool camera_allowed() = 0;
         virtual console_state console() = 0;
         virtual void forget( xpc_connection_t ) {}

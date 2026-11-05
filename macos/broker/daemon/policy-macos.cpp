@@ -4,6 +4,7 @@
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <Security/AuthSession.h>
+#include <Security/SecCode.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -161,6 +162,33 @@ namespace usbd
                 return RSUSB_AUTH_USER;
         }
         return camera_allowed() ? RSUSB_AUTH_OK : RSUSB_AUTH_CAMERA_DISABLED;
+    }
+
+    std::string macos_policy::peer_cdhash( xpc_object_t message )
+    {
+        // The message's audit token identifies the sender (no pid reuse race)
+        SecCodeRef code = nullptr;
+        if( ! message || SecCodeCreateWithXPCMessage( message, kSecCSDefaultFlags, &code ) != errSecSuccess || ! code )
+            return {};
+        CFDictionaryRef info = nullptr;
+        std::string rv;
+        if( SecCodeCopySigningInformation( code, kSecCSDefaultFlags, &info ) == errSecSuccess && info )
+        {
+            CFTypeRef u = CFDictionaryGetValue( info, kSecCodeInfoUnique );
+            if( u && CFGetTypeID( u ) == CFDataGetTypeID() && CFDataGetLength( static_cast< CFDataRef >( u ) ) == 20 )
+            {
+                static const char hex[] = "0123456789abcdef";
+                const UInt8 * b = CFDataGetBytePtr( static_cast< CFDataRef >( u ) );
+                for( int i = 0; i < 20; ++i )
+                {
+                    rv += hex[b[i] >> 4];
+                    rv += hex[b[i] & 15];
+                }
+            }
+            CFRelease( info );
+        }
+        CFRelease( code );
+        return rv;
     }
 
     bool macos_policy::camera_allowed()

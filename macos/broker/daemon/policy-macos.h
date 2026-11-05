@@ -36,6 +36,7 @@ namespace usbd
         uid_t peer_uid( xpc_connection_t peer ) override;
         pid_t peer_pid( xpc_connection_t peer ) override;
         rsusb_auth hello( xpc_connection_t peer ) override;
+        std::string peer_cdhash( xpc_object_t message ) override;
         bool camera_allowed() override;
         console_state console() override;
         void set_change_handler( std::function< void( change ) > handler ) override;

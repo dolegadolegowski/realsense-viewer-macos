@@ -7,6 +7,7 @@
 #include <dispatch/dispatch.h>
 #include <map>
 #include <mutex>
+#include <string>
 
 namespace usbd
 {
@@ -20,12 +21,15 @@ namespace usbd
         void set_camera_allowed( bool allowed, bool notify = true );   // reports a camera change
         void set_reject_signature( bool reject );  // the next peer behaves as a code-signing reject (messages dropped)
         void set_reject_all_signatures( bool reject );   // every later peer does (a non-allowlisted client build)
+        void set_next_peer_cdhash( std::string cdhash );   // returned by the next peer_cdhash call
+        unsigned peer_cdhash_calls();
 
         bool prepare( xpc_connection_t peer ) override;
         bool deliver( xpc_connection_t peer ) override;
         uid_t peer_uid( xpc_connection_t peer ) override;
         pid_t peer_pid( xpc_connection_t peer ) override;
         rsusb_auth hello( xpc_connection_t peer ) override;
+        std::string peer_cdhash( xpc_object_t message ) override;
         bool camera_allowed() override;
         console_state console() override;
         void forget( xpc_connection_t peer ) override;
@@ -41,6 +45,8 @@ namespace usbd
         console_state _console{ 501, 1 };
         bool _camera = true;
         bool _reject_all = false;
+        std::string _next_cdhash;
+        unsigned _cdhash_calls = 0;
         std::function< void( change ) > _handler;
         dispatch_queue_t _q;
     };
