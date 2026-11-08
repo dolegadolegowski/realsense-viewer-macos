@@ -213,11 +213,23 @@ func bundleIsTrusted() -> Bool {
 struct BuildInfo {
     let id: String?
     let number: Int?
+    let hashes: Set<String>
+    let daemon: String?
     init?(path: String) {
         guard let dict = NSDictionary(contentsOfFile: path) else { return nil }
         id = dict["BuildID"] as? String
         number = (dict["BuildNumber"] as? NSNumber)?.intValue
+        hashes = Set((dict["AllowedCDHashes"] as? [String]) ?? [])
+        daemon = dict["DaemonCDHash"] as? String
     }
+}
+
+// Other RealSense programs (e.g. IntelFaceScan) may add their own cdhashes to the installed allowlist. Such an
+// allowlist has another BuildID and a higher BuildNumber, but still admits everything this build ships and runs the
+// same daemon: it is as good as this build's own and must not trigger the "newer" or "update" dialogs.
+func installedCovers(_ installed: BuildInfo?, _ bundled: BuildInfo) -> Bool {
+    guard let installed, !bundled.hashes.isEmpty, let daemon = bundled.daemon else { return false }
+    return installed.daemon == daemon && bundled.hashes.isSubset(of: installed.hashes)
 }
 
 enum Situation {
@@ -240,16 +252,18 @@ func situation(for probe: Probe) -> Situation {
         return .switchedOff
     }
     let installed = BuildInfo(path: installedConfig)
-    if let i = installed?.number, let b = bundled.number, i > b { return .daemonNewer }
-    if installed?.id == nil || installed?.id != bundled.id || probe.code == 5 { return .needsUpdate }
+    let covers = installedCovers(installed, bundled)
+    if !covers, let i = installed?.number, let b = bundled.number, i > b { return .daemonNewer }
+    if !covers && (installed?.id == nil || installed?.id != bundled.id) || probe.code == 5 { return .needsUpdate }
     return .needsReinstall
 }
 
 // The probe only shows that this bundle's realsense-usbd is admitted, which stays true when a newer build changed only
 // the tools: the installed allowlist must also be this build's, or the tool itself would be turned away.
 func installedIsThisBuild() -> Bool {
-    guard let bundled = BuildInfo(path: bundledAllowlist)?.id else { return false }
-    return BuildInfo(path: installedConfig)?.id == bundled
+    guard let bundled = BuildInfo(path: bundledAllowlist), let id = bundled.id else { return false }
+    let installed = BuildInfo(path: installedConfig)
+    return installed?.id == id || installedCovers(installed, bundled)
 }
 
 // Decide before AppKit starts: when the daemon admits this build, become the tool right away.
