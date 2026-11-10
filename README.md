@@ -15,15 +15,20 @@ are disabled"*; this project makes both work.
 > (akcelerometr + żyroskop), nagrywanie i odtwarzanie, eksport PLY/PNG/CSV, filtry post‑processingu,
 > presety, kalibracja on‑chip, aktualizacja firmware. Instalacja: otwórz plik DMG i przeciągnij
 > „RealSense Viewer” do Aplikacji. macOS pozwala przejąć kamerę od wbudowanego sterownika USB wideo tylko
-> administratorowi (root), dlatego przy pierwszym uruchomieniu Viewer proponuje **„Install camera access for all
-> users”**: administrator raz podaje nazwę i hasło, a instalowana jest mała usługa systemowa *realsense-usbd*
-> (LaunchDaemon). Od tej chwili Viewer, Depth Quality Tool i narzędzia `rs-*` z tego samego DMG działają **bez
-> hasła, także na kontach standardowych** (tylko użytkownik zalogowany przy ekranie Maca i root).
+> administratorowi (root), dlatego przy pierwszym uruchomieniu Viewer sam instaluje **usługę kamery RealSense**
+> (*realsense-usbd*, mały LaunchDaemon): macOS pyta o nazwę i hasło administratora — jeden raz na danym Macu.
+> Od tej chwili Viewer, Depth Quality Tool, narzędzia `rs-*` i inne aplikacje RealSense, na przykład
+> [IntelFaceScan](https://github.com/dolegadolegowski/IntelFaceScan), działają **bez hasła, także na kontach
+> standardowych** (tylko użytkownik zalogowany przy ekranie Maca i root). Usługa jest wspólna dla wszystkich
+> aplikacji i nie jest związana z plikiem DMG ani z wersją aplikacji: nowe wersje aplikacji nie wymagają jej
+> aktualizacji, a jeśli zainstalowała ją wcześniej inna aplikacja, Viewer korzysta z niej bez pytania o hasło.
 > **Prywatność:** obraz z kamery przez tę usługę nie zapala wskaźnika kamery macOS i nie wywołuje pytania o
 > zgodę; respektowany jest tylko zakaz kamery z MDM/Czasu przed ekranem (`allowCamera`). **Bezpieczeństwo:**
-> usługa wpuszcza tylko programy z tej samej kompilacji (lista skrótów cdhash) — to przypięcie wersji, nie
-> izolacja przed złośliwym kodem działającym jako zalogowany użytkownik. Bez instalacji pozostaje dotychczasowe
-> „Run once as administrator” (hasło przy każdym uruchomieniu). Odinstalowanie:
+> usługa nie sprawdza, jaki program się z nią łączy — z kamer RealSense może przez nią korzystać każdy program
+> działający jako użytkownik zalogowany przy ekranie Maca (administrator może to ograniczyć listą
+> `AllowedCDHashes`). Usługa otwiera wyłącznie kamery RealSense, sprawdza każde żądanie i odrzuca nieodwracalne
+> polecenia pamięci flash. Po anulowaniu instalacji pozostaje dotychczasowe „Run once as administrator” (hasło
+> przy każdym uruchomieniu). Odinstalowanie:
 > `sudo "/Applications/RealSense Viewer.app/Contents/Resources/realsense-usbd/uninstall-camera-access.sh"`.
 
 ## Features
@@ -71,9 +76,11 @@ Not tested on purpose: flashing firmware and writing calibration to the camera.
    open a downloaded copy — go to *System Settings → Privacy & Security* and click **Open Anyway**, or run
    `xattr -dr com.apple.quarantine "/Applications/RealSense Viewer.app"`.
 4. Connect the camera directly with a USB‑C (USB 3) cable and start **RealSense Viewer**.
-5. The first start offers **Install camera access for all users**: an administrator enters their name and
-   password once (this works from a standard account too). From then on the viewer starts without any
-   password, for every user of the Mac. See [Camera access](#camera-access-no-password).
+5. At its first start the viewer installs the **RealSense camera service**: macOS asks for an administrator's
+   name and password once (this works from a standard account too). From then on the viewer starts without any
+   password, for every user of the Mac, and so does every other RealSense application that uses the service.
+   When the service is already on the Mac (another application installed it), nothing is asked. See
+   [Camera access](#camera-access-no-password).
 
 ### Why is an administrator needed?
 
@@ -82,138 +89,164 @@ driver for the IMU). The SDK talks to the camera through libusb, which has to *c
 those drivers — and macOS only allows that for root (or for apps holding a restricted Apple entitlement).
 There are two ways to give the viewer that right:
 
-* **Camera access** (recommended): a small root service, installed once by an administrator, does the USB work
-  for the viewer, which itself runs as you.
+* **The RealSense camera service** (the default): a small root service, installed once per Mac, does the USB
+  work for the viewer and for every other RealSense application; the applications themselves run as you.
 * **Run once as administrator**: the app asks for an administrator password with the standard macOS dialog,
   runs the viewer with administrator rights in your session, and when you quit gives the camera back to macOS
   (so the RGB camera works again as a webcam in FaceTime, Zoom, …) and returns ownership of the settings file and
-  of files saved to *Documents* to your user. The app offers this when camera access is not installed or not
-  usable.
+  of files saved to *Documents* to your user. The app offers this when the installation of the service was
+  cancelled or failed, or when the service cannot be used.
 
 ## Camera access (no password)
 
-`realsense-usbd` is a root LaunchDaemon (`io.github.dolegadolegowski.realsense-usbd`) that captures RealSense
-cameras from macOS and forwards librealsense's USB requests to them for the programs of one build of this
-project. librealsense asks it first and falls back to its normal in‑process libusb path (which needs root) when
-it is not installed, switched off, or does not admit the program. Design: [`macos/broker/DESIGN.md`](macos/broker/DESIGN.md).
+`realsense-usbd` is the **RealSense camera service**: a root LaunchDaemon
+(`io.github.dolegadolegowski.realsense-usbd`) that captures RealSense cameras from macOS and forwards librealsense's
+USB requests to them. There is one per Mac, and it is shared: it serves every program of the user logged in at the
+Mac's screen and does not check which program is asking. RealSense Viewer, the Depth Quality Tool, the `rs-*` tools,
+[IntelFaceScan](https://github.com/dolegadolegowski/IntelFaceScan) and applications written later all use the same
+installed service, so it is not tied to a DMG or to the version of an application. librealsense asks it first and
+falls back to its normal in‑process libusb path (which needs root) when it is not installed, switched off, or does
+not admit the program. Design: [`macos/broker/DESIGN.md`](macos/broker/DESIGN.md).
 
-Status: new in this version. Its hardware checks (DESIGN.md 9.2) on the D455 are still to be done; the
-*Verified* list above covers the *Run once as administrator* path.
+Status: the shared service (the second generation of `realsense-usbd`; the first admitted only the programs of one
+DMG) is new in this version. First run on hardware, 2026-11-10 (M3 Ultra, macOS 27.2, D455 with firmware 5.16.0.1
+on USB 3.2, an administrator account at the screen): the service was installed by IntelFaceScan's copy of the
+installer after the administrator prompt; RealSense Viewer from this repository, which carries another build of the
+same service version, then started without any prompt and opened the camera as the user; `rs-enumerate-devices` and
+`rs-macos-selftest` ran without `sudo`, the self-test passing all 24 checks (enumeration, hardware monitor, options,
+the 6 visual presets, depth + 2×IR, RGB, accelerometer and gyroscope at 400 Hz, all sensors at once, recording to
+`.db3` and playback, repeated start/stop of RGB/IMU while depth streams); five seconds after the last program closed
+the camera the service handed it back to macOS. Still to be done from DESIGN.md 9.2: the `--stress` run and the soak
+test through the service, a standard account, a second user session, the Login Items switch, an update over an
+installed service, a restart of the Mac, MDM camera restrictions, firmware update, two cameras. The *Verified* list
+above was made with the *Run once as administrator* path.
 
-**Install** (an administrator, once per Mac and per DMG version):
+**Install** (once per Mac, with an administrator's name and password):
 
-* start **RealSense Viewer** from */Applications* and click **Install camera access for all users** — the
-  button is only offered when the app and every folder above it can be changed only by root or an administrator
-  (so for a standard user not in `~/Applications` or `~/Downloads`, and not a translocated or quarantined copy run
-  from the DMG); or
-* from the DMG's Tools folder:
+* start **RealSense Viewer** from */Applications*. When the service is not installed, is too old for the app or does
+  not answer, the app goes straight to the macOS administrator prompt, installs the service and then starts the
+  viewer. If the prompt is cancelled or the installation fails, a dialog offers **Install camera service**, **Run
+  once as administrator** and **Cancel**. The app installs only from a copy that, together with every folder above
+  it, can be changed only by root or an administrator (so for a standard user not in `~/Applications` or
+  `~/Downloads`, and not a translocated or quarantined copy run from the DMG); otherwise it says that an
+  administrator must move it to */Applications*; or
+* in Terminal, as the user logged in at the Mac's screen:
+  `"/Applications/RealSense Viewer.app/Contents/Resources/realsense-usbd/ensure-camera-access.sh"` (the same script
+  is in `RealSense Tools/camera-access/`). It prints `ok <service version>` when the service answers; otherwise it
+  shows the same administrator prompt and installs it. With `--check` it only reports (exit status 0: answering,
+  10: not installed); or
+* as root, for example over SSH or from a management tool:
   `sudo "RealSense Tools/camera-access/install-camera-access.sh" --source "RealSense Tools/camera-access"`.
 
-The installer refuses files that a non‑administrator could have changed, checks the daemon's code signature
-against the allowlist, and writes:
+The installer refuses files that a non‑administrator could have changed, checks the daemon's code signature against
+the manifest it ships with (`service.plist`), never replaces a newer service or a working one of the same version,
+and writes:
 
 | file | |
 |---|---|
 | `/Library/PrivilegedHelperTools/io.github.dolegadolegowski.realsense-usbd` | the daemon |
 | `/Library/LaunchDaemons/io.github.dolegadolegowski.realsense-usbd.plist` | its launchd job (started on demand, exits when idle) |
-| `/Library/Application Support/RealSense Viewer/usbd.plist` | allowlist of this build and optional administrator settings |
-| `/Library/Application Support/RealSense Viewer/usbd.d/<name>.plist` | allowlists of other apps (see below), each added once by an administrator, kept by updates |
-| `/Library/PrivilegedHelperTools/io.github.dolegadolegowski.realsense-usbd-allowlist.sh` | the tool other apps use to add their list |
+| `/Library/Application Support/io.github.dolegadolegowski.realsense-usbd/usbd.plist` | service and protocol versions, optional administrator settings |
+| `/Library/Application Support/RealSense Viewer/usbd.plist` | a marker for apps of the first generation (up to release `v2.58.4-macos.3`), so that they do not install their old daemon over this one |
 
 macOS then shows *"Background Items Added"*; the entry appears in *System Settings → General → Login Items &
-Extensions*. An administrator can switch it off there (the app then offers *Open Login Items settings*); a
+Extensions*. An administrator can switch it off there (the app then offers *Open Login Items Settings*); a
 standard user cannot.
 
 **Standard accounts:** after the installation every user can use the camera without a password, but only the
 user logged in at the Mac's screen (and root) — not a second, fast‑user‑switched session in the background and
 not an SSH login.
 
-**Updates:** camera access admits exactly the programs of the DMG it was installed from (their code hashes).
-After installing the apps from a newer DMG the app offers **Update camera access** (an administrator again).
-Install the viewer, the Depth Quality Tool and the command line tools from the same DMG. Camera access is never
-silently downgraded: an older app reports that camera access is newer than the app. An update keeps the lists of
-other apps.
+**Other applications:** whichever application starts first installs the service; the others find it and use it
+without asking. Every application carries its own copy of the daemon and of the installer, so none depends on
+another being installed. See [Using the camera service from another
+application](#using-the-camera-service-from-another-application).
+
+**Updates:** a new version of the viewer, or of any other application, needs no update of the service, because the
+service does not know which programs use it. It is updated only when an application needs a newer service than the
+Mac has: a first‑generation installation (from release `v2.58.4-macos.3`), or a service that does not speak the
+application's protocol version. The app then shows the administrator prompt as at the first installation. The
+service is never downgraded: an installer that carries an older service than the installed one keeps the installed
+one and only makes sure that it runs, and a service of the same version that is installed and answering is left as
+it is, so two applications never replace and restart each other's copy (`--allow-downgrade` overrides both).
+`realsense-usbd --version`, in an app's
+`Contents/MacOS` or at the installed path, prints the service and protocol versions. Apps of the first generation
+do not recognize the shared service and report that camera access is newer than the app: update them as well.
 
 **Uninstall:** `sudo "/Applications/RealSense Viewer.app/Contents/Resources/realsense-usbd/uninstall-camera-access.sh"`
 (or the same script in `RealSense Tools/camera-access/`). It stops the daemon, gives every camera it captured back
-to macOS and removes its files; it also removes the lists of other apps and the list tool. The app then asks again
-at the next start.
+to macOS and removes the files above. This removes the service for every application that uses it; each of them
+shows the administrator prompt again at its next start.
 
-**Administrator settings** (optional keys in `usbd.plist`, kept by updates): `HandBackGraceSeconds` (0–600,
-default 5: how long a camera stays captured after the last program closed it), `IdleExitSeconds` (10–3600,
+**Administrator settings** (optional keys in the installed `usbd.plist`, kept by updates): `HandBackGraceSeconds`
+(0–600, default 5: how long a camera stays captured after the last program closed it), `IdleExitSeconds` (10–3600,
 default 60), `DeniedHWMOpcodes` (array of hardware‑monitor opcodes to refuse) and `ProtectedFlashRanges` (array
 of `{Start, Length}` flash byte ranges whose erase/write is refused). For D585S safety cameras, D500
-`SAFETY_PRESET_WRITE` (`0x95`) and `CALIBRESTOREEPROM` (`0xA8`) are candidates for `DeniedHWMOpcodes`. Restart the
-daemon after a change: `sudo launchctl kickstart -k system/io.github.dolegadolegowski.realsense-usbd`.
-
-### Camera access for other apps
-
-Other projects that use librealsense with the same broker client (patch `0002-macos-usb-broker.patch`), e.g.
-IntelFaceScan, can use camera access too: an administrator adds the app's own allowlist once, and from then on its
-programs use RealSense cameras without a password, for every user of the Mac, with the same rules as the viewer
-(only the user at the screen, only RealSense devices). Such apps offer an **Enable camera access for *app*** step
-themselves (an administrator's name and password, once per app version). Their lists live in
-`/Library/Application Support/RealSense Viewer/usbd.d/` next to the viewer's own `usbd.plist`, which they never
-change; updates of camera access keep them, uninstalling camera access removes them. At most 16 lists and 256
-programs in total (with the viewer's own) are admitted. This needs camera access installed from a build that has
-`camera-access-allowlist.sh` (release `v2.58.4-macos.3` does not); with an older one, update camera access first.
-Status: covered by host tests (the daemon's list handling against the mock backend, the real code-signing
-requirement in-process, the scripts' dry runs), not yet by the hardware checks.
-
-By hand (the app ships its list, e.g. in `Contents/Resources/camera-access/<name>.plist`; it must be in a folder
-only root or an administrator can change, such as `/Applications`):
-
-```bash
-sudo /bin/bash /Library/PrivilegedHelperTools/io.github.dolegadolegowski.realsense-usbd-allowlist.sh \
-    --add io.github.dolegadolegowski.intelfacescan \
-    --source "/Applications/IntelFaceScan.app/Contents/Resources/camera-access/io.github.dolegadolegowski.intelfacescan.plist"
-sudo /bin/bash /Library/PrivilegedHelperTools/io.github.dolegadolegowski.realsense-usbd-allowlist.sh \
-    --remove io.github.dolegadolegowski.intelfacescan
-```
-
-Adding or removing a list restarts the daemon, so RealSense programs that are running lose the camera for a moment
-and reconnect. The installed lists: `ls "/Library/Application Support/RealSense Viewer/usbd.d"`; the daemon also
-logs them when it starts (`allowlist usbd.d/<name>: ...`, and a fault line for every list it skips).
+`SAFETY_PRESET_WRITE` (`0x95`) and `CALIBRESTOREEPROM` (`0xA8`) are candidates for `DeniedHWMOpcodes`.
+`AllowedCDHashes` (array of up to 256 code directory hashes, 40 lowercase hex digits each, the `CDHash` line of
+`codesign -dvvv --arch arm64 <program>`) restricts the service to the listed programs: every other program is
+turned away and falls back to the root‑only path within about a second. List every program that opens a camera and
+each application's own `realsense-usbd`, which the application runs to ask whether the service admits it. The hash
+of a program changes with every build, so this list has to be maintained with every update of an application.
+Restart the daemon after a change: `sudo launchctl kickstart -k system/io.github.dolegadolegowski.realsense-usbd`.
 
 ### Security model
 
-* The daemon runs as root. It admits a program only if its code hash (cdhash) is in the allowlist of the
-  installed build **and** it runs as root or as the user logged in at the Mac's screen in a local graphical
-  session. Programs of other builds fall back to the root‑only in‑process path within about a second.
-* The allowlist is **version pinning, not code containment**: anything running as the logged‑in user can start
-  an allowlisted program, or copy an app and swap its (ad‑hoc signed) libraries — the cdhash covers only the
-  main executable. Malware running as you can therefore use the camera through the daemon and reach its message
-  parser; through the daemon it reaches nothing but RealSense cameras (no files, no network, no other devices).
+* The daemon runs as root. It admits a program that runs as root or as the user logged in at the Mac's screen in a
+  local graphical session, **whatever program it is**. Any program running as that user can therefore use RealSense
+  cameras through the daemon and reach its message parser — a program the user never meant to give a camera to, and
+  malware running as the user, included. This is what lets applications written later use the service without
+  updating it. Through the daemon a program reaches nothing but RealSense cameras (no files, no network, no other
+  devices).
+* Only the console user and root: a second, fast‑user‑switched session in the background, an SSH login and system
+  accounts are refused, and a session loses its cameras when its user stops being the one at the screen.
 * Only RealSense devices are ever opened (vendor `0x38E5`, and `0x8086` only with a RealSense product ID from
   librealsense), never a device with an audio, mass‑storage, hub, network, wireless or boot keyboard/mouse
   interface. Every request is validated; a program can only use interfaces it opened, and only class requests.
 * Erasing the whole flash and permanently locking or unlocking it (hardware‑monitor opcodes `FEF`, `FSRU`,
   `FPLOCK`) are always refused. Everything else librealsense does is allowed — including firmware updates and
-  writing calibration, so a standard user can make a camera need recovery unless `ProtectedFlashRanges` /
-  `DeniedHWMOpcodes` are configured.
+  writing calibration, so any program of the logged‑in user can make a camera need recovery unless
+  `ProtectedFlashRanges` / `DeniedHWMOpcodes` are configured. The same filter applies to the raw hardware‑monitor
+  commands of `rs-terminal`.
 * The camera ban of an MDM profile or Screen Time (`com.apple.applicationaccess` `allowCamera = false`) blocks
   the daemon for everyone, root included, and ends running sessions.
-* Command line tools that send raw hardware‑monitor commands (`rs-terminal`) or open no camera, and the build tree
-  (`build/Release`), are not allowlisted: they need sudo as before.
+* `AllowedCDHashes` (see *Administrator settings*) brings back the first generation's restriction to listed
+  programs. It is **version pinning, not code containment**: anything running as the logged‑in user can start a
+  listed program, or copy an app and swap its (ad‑hoc signed) libraries — the cdhash covers only the main
+  executable.
 * The installer only takes files from folders that only root/administrators can change, never from a
-  translocated app, and generates the launchd job and settings itself instead of copying them.
-* Lists of other apps (`usbd.d`) widen the set of admitted programs with the same caveats (version pinning, not
-  code containment). Only root writes them, an administrator adds each one, and they can neither change the
-  daemon's settings nor displace the viewer's own list or stop the daemon from starting (invalid lists are skipped
-  and logged). The list tool applies the installer's checks to the app's list and writes only validated values.
+  translocated app, and generates the launchd job and settings itself instead of copying them. The daemon it
+  installs is the one the application carries: as with any installer, the administrator who enters the password
+  trusts the application that asks.
 
 ### Privacy
 
 * Depth, infrared and RGB streamed through the daemon do **not** light up the macOS camera indicator and do not
-  trigger the camera permission prompt: macOS does not see a camera being used, only a USB device. Privacy
-  (PPPC) profiles cannot target it; only the `allowCamera` ban above is honoured.
-* The daemon logs to the unified log (subsystem `io.github.dolegadolegowski.realsense-usbd`): admitted (with the
-  allowlist that admitted it: `usbd.plist` or the name of another app's list) and rejected programs (pid, uid,
-  path), camera capture and hand‑back, device arrival/removal, refused commands —
+  trigger the camera permission prompt: macOS does not see a camera being used, only a USB device. Together with the
+  admission rule above this means that any program running as the user at the Mac's screen can read images from a
+  connected RealSense camera without macOS asking or showing anything. Privacy (PPPC) profiles cannot target it;
+  only the `allowCamera` ban above is honoured. Where that is not acceptable, unplug the camera when it is not in
+  use, restrict the service with `AllowedCDHashes`, switch it off in *Login Items & Extensions* or uninstall it.
+* The daemon logs to the unified log (subsystem `io.github.dolegadolegowski.realsense-usbd`): admitted and
+  rejected programs (pid, uid, path), camera capture and hand‑back, device arrival/removal, refused commands —
   never image data or command payloads. `log show --last 1h --predicate 'subsystem ==
-  "io.github.dolegadolegowski.realsense-usbd"'` shows them.
-* Non‑RealSense webcams: the root path of the viewer also lists third‑party UVC webcams; through camera access
-  they are not shown, because the daemon never captures devices other than RealSense cameras.
+  "io.github.dolegadolegowski.realsense-usbd"'` shows them, and with them which programs used a camera.
+* Non‑RealSense webcams: the root path of the viewer also lists third‑party UVC webcams; through the camera
+  service they are not shown, because the daemon never captures devices other than RealSense cameras.
+
+## Using the camera service from another application
+
+[`macos/broker`](macos/broker) is a self‑contained kit that other projects copy unchanged (IntelFaceScan has it as
+`third_party/realsense-usbd`): the daemon and its build script, the installer scripts, the librealsense client
+patch and `client/RealSenseCameraAccess.swift`, one Swift file that tells an application whether the service is
+installed and answering and installs it when it is not. An application builds its librealsense with the patch,
+puts `realsense-usbd`, its manifest and the scripts into its bundle, and asks for the service's state at start;
+applications in other languages run the bundled `ensure-camera-access.sh` instead. Because the service does not
+check which program connects, a new application needs no change to an installed service.
+
+The integration guide is [`macos/broker/README.md`](macos/broker/README.md). In this repository
+[`macos/launcher/main.swift`](macos/launcher/main.swift) and the camera service part of
+[`scripts/package.sh`](scripts/package.sh) are a complete example.
 
 ## Deploying to many Macs
 
@@ -221,6 +254,20 @@ logs them when it starts (`allowlist usbd.d/<name>: ...`, and a fault line for e
 own Mac as your normal user (no sudo). For every target it logs in over SSH as an administrator account, and there,
 with `sudo`, `remote-install.sh` downloads the release DMG from GitHub, checks it and installs it. Afterwards every
 user of those Macs starts RealSense Viewer from *Launchpad* or *Applications* without a password.
+
+The scripts are pinned to release `v2.58.4-macos.3`, and this section describes that release. Its camera access is
+the first generation, which admits only the programs of that DMG, not the shared service described above. On a Mac
+that already has the shared service, a run that installs or updates (the default, also with `--tools`) reports that
+the installed camera access is newer, changes nothing and counts the Mac as `FAILED`. Do not pass
+`--allow-downgrade` there: the old installer would put its own daemon in place of the shared one, and other
+applications would lose the camera until one of them installs the service again. Two options do change such a Mac:
+
+* `--uninstall` runs the uninstaller of the apps installed there, which removes the shared service for every
+  application that uses it, not only for RealSense Viewer. Each of those applications then asks for an administrator
+  again. The uninstaller of a first‑generation app also leaves the shared service's configuration folder behind
+  (`/Library/Application Support/io.github.dolegadolegowski.realsense-usbd`).
+* `--apps-only` skips the check and installs the apps of the pinned release. They do not know the shared service:
+  each start says that camera access is newer than the app and offers only *Run once as administrator*.
 
 **Prerequisites on every target Mac**
 
@@ -308,9 +355,23 @@ Finder, and run the command again.
 * `--dry-run --root <dir>` is a test mode for `scripts/test-deploy.sh` only (it needs that script's fake `sudo`).
 
 `scripts/test-deploy.sh` tests both scripts and the one-line command without root, SSH or network (dry runs into a
-temporary folder, a fake `ssh`, `sudo` and `curl`). Maintainers: attach `dist/rs-deploy-<tag>.tar.gz` from
-`scripts/deploy/make-bundle.sh` to the release next to the DMG; the test fails when the hash in this README no
-longer matches the scripts.
+temporary folder, a fake `ssh`, `sudo` and `curl`). It needs the DMG of the pinned release: pass its path as the
+first argument, because `scripts/package.sh` replaces everything in `dist/`, where the test looks by default.
+Maintainers: attach `dist/rs-deploy-<tag>.tar.gz` from `scripts/deploy/make-bundle.sh` to the release next to the
+DMG; the test fails when the hash in this README no longer matches the scripts.
+
+Maintainers, when a release with the shared camera service is published: adapt the deployment scripts before
+re-pinning them. `remote-install.sh` compares `BuildNumber` from the DMG's
+`Contents/Resources/realsense-usbd/allowlist.plist` with `BuildNumber` in
+`/Library/Application Support/RealSense Viewer/usbd.plist` to refuse a release older than what is installed. A DMG
+with the shared service has `service.plist` with `ServiceVersion` instead, the installed configuration is
+`/Library/Application Support/io.github.dolegadolegowski.realsense-usbd/usbd.plist`, and its installer keeps a newer
+installed service by itself and exits 0, so that case no longer has to fail the Mac. The messages that speak of a
+camera access build and of tools that only work with the same build change with it, and so does the *newer camera
+access installed* case of `scripts/test-deploy.sh`, which writes a `BuildNumber`. Then re-pin: `PINNED_TAG`,
+`PINNED_ASSET` and `PINNED_SHA256` in `deploy-macs.sh` and `remote-install.sh`, `SHA` and the default DMG in
+`scripts/test-deploy.sh`, and, after `make-bundle.sh`, the bundle's name and SHA-256 in the two one-line commands
+above (English and Polish) and in *Security notes*.
 
 > 🇵🇱 **Po polsku:** `deploy-macs.sh` instaluje lub aktualizuje RealSense Viewer, Depth Quality Tool i dostęp do
 > kamery (*realsense-usbd*) na wielu Macach naraz przez SSH. Uruchamiasz go na swoim Macu jako zwykły użytkownik
@@ -325,7 +386,13 @@ longer matches the scripts.
 > wierszu poleceń ani w pliku); jeśli pierwszy Mac odrzuci hasło, pozostałe są pomijane. `-f plik.txt` czyta listę
 > komputerów (jeden na linię), `--tools` dodaje narzędzia `rs-*`, `--uninstall --remove-apps` usuwa wszystko. Na
 > końcu jest podsumowanie OK/FAILED/SKIPPED dla każdego Maca. Zerwane połączenie nie przerywa instalacji na Macu,
-> który już zaczął — wystarczy uruchomić polecenie ponownie, żeby zobaczyć stan.
+> który już zaczął — wystarczy uruchomić polecenie ponownie, żeby zobaczyć stan. Skrypty instalują wydanie
+> `v2.58.4-macos.3`, czyli pierwszą generację dostępu do kamery (tylko programy z tego DMG), a nie opisaną wyżej
+> wspólną usługę kamery. Na Macu, który ma już wspólną usługę, zwykła instalacja lub aktualizacja niczego nie
+> zmienia i zgłasza FAILED; nie używaj tam `--allow-downgrade`, bo stary instalator zastąpiłby wspólną usługę
+> swoją. Dwie opcje taki komputer jednak zmieniają: `--uninstall` usuwa wspólną usługę dla wszystkich aplikacji,
+> które z niej korzystają (każda z nich znów poprosi o administratora), a `--apps-only` instaluje aplikacje
+> pierwszej generacji, które przy wspólnej usłudze uruchamiają się tylko z hasłem administratora.
 
 ## Command line tools
 
@@ -337,8 +404,10 @@ longer matches the scripts.
 "RealSense Tools/bin/rs-macos-usbdump"           # what librealsense's USB layer sees (opens nothing)
 ```
 
-With camera access installed they run without sudo (except `rs-terminal`). Without it, run them with `sudo`;
-afterwards `sudo "RealSense Tools/bin/rs-macos-release"` gives the camera back to macOS.
+With the camera service installed all of them run without sudo, `rs-terminal` included: the service admits every
+program of the user at the Mac's screen. `"RealSense Tools/camera-access/ensure-camera-access.sh"` installs the
+service when it is missing (the administrator prompt) and `--check` only reports. Without the service, run the tools
+with `sudo`; afterwards `sudo "RealSense Tools/bin/rs-macos-release"` gives the camera back to macOS.
 
 ## Build from source
 
@@ -348,26 +417,36 @@ CMake (`brew install cmake`).
 ```bash
 git clone --recurse-submodules https://github.com/dolegadolegowski/realsense-viewer-macos.git
 cd realsense-viewer-macos
-scripts/build.sh      # applies patches/ to librealsense v2.58.4 and builds everything into build/
+scripts/build.sh      # patches librealsense v2.58.4 (patches/ and the camera service client), builds into build/
 scripts/package.sh    # creates dist/*.app, dist/RealSense Tools and the DMG
 ```
 
 The GitHub Actions workflow (`.github/workflows/build.yml`, macOS 27 runner) builds the DMG on demand
-(*Actions → build → Run workflow*), optionally attaching it to an existing release.
+(*Actions → build → Run workflow*), runs the camera service tests below, and optionally attaches the DMG to an
+existing release.
 
-The binaries in `build/Release` are not allowlisted for camera access; run them with `sudo`, or use the
-packaged apps and tools. `scripts/test-camera-access.sh` tests the camera access installer, uninstaller and list
-tool without root (dry runs into a temporary folder); `build/usbd/rs-usbd-tests` runs the daemon's host tests and
-`build/usbd/rs-usbd-testd --inprocess` its real code-signing checks without launchd or root;
-`scripts/build.sh --asan|--tsan|--fuzz` adds sanitizer and fuzzer builds of the daemon tests.
+The binaries in `build/Release` reach the camera through the camera service like any other program when it is
+installed on the Mac; without it, run them with `sudo`. Tests that need no camera and no root:
+
+```bash
+# the daemon on a mock USB backend, and librealsense's client against that daemon
+build/usbd/rs-usbd-tests
+# installer, uninstaller, manifest and ensure-camera-access.sh --check, as dry runs into a temporary folder
+macos/broker/tests/test-camera-access.sh build/Release/realsense-usbd
+```
+
+`scripts/build.sh --asan|--tsan` adds sanitizer builds of the daemon tests (`build/usbd/asan`, `build/usbd/tsan`);
+the fuzzer `build/usbd/rs-usbd-fuzz` is always built.
 
 `VIEWER_TESTS=ON scripts/build.sh` additionally builds `realsense-viewer-tests`, the upstream GUI test suite
 (ImGui Test Engine) that drives the real viewer UI: `sudo build/Release/realsense-viewer-tests --auto`.
 
 ## What was changed in librealsense
 
-The camera access client (librealsense asks `realsense-usbd` first, then falls back to in‑process libusb) is
-[`patches/0002-macos-usb-broker.patch`](patches/0002-macos-usb-broker.patch). All other changes are in
+The camera service client (librealsense asks `realsense-usbd` first, then falls back to in‑process libusb) is
+[`macos/broker/librealsense/macos-usb-broker.patch`](macos/broker/librealsense/macos-usb-broker.patch). It is part
+of the kit in `macos/broker` because every application that uses the service builds its librealsense with it;
+`scripts/apply-patches.sh` applies it after the patches in `patches/`. All other changes are in
 [`patches/0001-macos-apple-silicon-support.patch`](patches/0001-macos-apple-silicon-support.patch):
 
 * **Sensor power accounting (libc++)** — `rsutils::deferred` relied on the defaulted move of
@@ -420,18 +499,26 @@ Hangs and crashes found by a stability review (static analysis, ASan/UBSan/TSan 
   descriptors that don't follow links (a planted symlink or hard link could make root give away a system file),
   and the log file named in the user‑writable settings is opened the same way.
 
-macOS‑specific additions in this repository: the camera access daemon and its installer (`macos/broker`), the
-app launcher (`macos/launcher`), `rs-macos-usbdump`, `rs-macos-release`
+macOS‑specific additions in this repository: the camera service daemon, its installer and the client file for
+applications (`macos/broker`), the app launcher (`macos/launcher`), `rs-macos-usbdump`, `rs-macos-release`
 (re‑enumerates the camera to hand it back to macOS), `rs-macos-handback` (returns ownership of the files the
 viewer created) and `rs-macos-selftest` (`--stress` adds start/stop cycles, recording toggled while streaming,
 presets changed while streaming, a long run of every sensor and a hardware reset).
 
 ## Known limitations
 
-* Without camera access an administrator password is needed every time the viewer starts (macOS USB
-  security, see above); with it, every daemon update needs an administrator once.
-* Through camera access the macOS camera indicator stays off and third‑party webcams are not listed (see
+* Without the camera service an administrator password is needed every time the viewer starts (macOS USB
+  security, see above). Installing the service needs an administrator once per Mac, and again only when an
+  application needs a newer service than the installed one.
+* The camera service does not tell programs apart: any program running as the user at the Mac's screen can use a
+  connected RealSense camera through it (see *Security model*).
+* Through the camera service the macOS camera indicator stays off and third‑party webcams are not listed (see
   *Privacy*).
+* The shared camera service has had its first run on a D455, not yet the full hardware test plan (see *Camera
+  access*, Status).
+* Apps of the first generation (up to release `v2.58.4-macos.3`) do not start without a password once the shared
+  service is installed; they report that camera access is newer than the app. Install this version of the apps.
+* The deployment scripts still install release `v2.58.4-macos.3` (see *Deploying to many Macs*).
 * Toggling the RGB stream while depth is streaming makes the camera firmware restart the depth stream
   briefly (frame counters reset) — this is camera behaviour, not specific to macOS.
 * "Use GLSL for rendering/processing" options are not available on macOS (upstream limitation of the

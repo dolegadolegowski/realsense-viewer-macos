@@ -4,15 +4,53 @@
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <Security/AuthSession.h>
-#include <Security/SecCode.h>
+#include <Security/Security.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
+#include <cstdio>
 
 namespace usbd
 {
+    std::string running_cdhash()
+    {
+        SecCodeRef code = nullptr;
+        CFDictionaryRef info = nullptr;
+        std::string rv;
+        if( SecCodeCopySelf( kSecCSDefaultFlags, &code ) == errSecSuccess
+            && SecCodeCopySigningInformation( code, kSecCSDefaultFlags, &info ) == errSecSuccess )
+        {
+            CFTypeRef h = CFDictionaryGetValue( info, kSecCodeInfoUnique );
+            if( h && CFGetTypeID( h ) == CFDataGetTypeID() && CFDataGetLength( static_cast< CFDataRef >( h ) ) == 20 )
+                for( CFIndex i = 0; i < 20; ++i )
+                {
+                    char b[3];
+                    snprintf( b, sizeof( b ), "%02x", CFDataGetBytePtr( static_cast< CFDataRef >( h ) )[i] );
+                    rv += b;
+                }
+        }
+        if( info )
+            CFRelease( info );
+        if( code )
+            CFRelease( code );
+        return rv;
+    }
+
+    std::vector< std::string > required_cdhashes( const std::vector< std::string > & allowed,
+                                                  const std::string & daemon_cdhash )
+    {
+        std::vector< std::string > r = allowed;
+        bool hex40 = daemon_cdhash.size() == 40 && std::all_of( daemon_cdhash.begin(), daemon_cdhash.end(), []( char c ) {
+            return ( c >= '0' && c <= '9' ) || ( c >= 'a' && c <= 'f' );
+        } );
+        if( ! r.empty() && hex40 && std::find( r.begin(), r.end(), daemon_cdhash ) == r.end() )
+            r.push_back( daemon_cdhash );
+        return r;
+    }
+
     std::string cdhash_requirement( const std::vector< std::string > & cdhashes )
     {
         std::string r;
@@ -111,9 +149,10 @@ namespace usbd
     {
         if( ! _o.queue )
             _o.queue = dispatch_get_main_queue();
-        _requirement = cdhash_requirement( _o.cdhashes );
-        if( _o.lightweight && ! _o.cdhashes.empty() )
-            _lwcr = cdhash_lightweight_requirement( _o.cdhashes );
+        _required = required_cdhashes( _o.cdhashes, _o.daemon_cdhash );
+        _requirement = cdhash_requirement( _required );
+        if( _o.lightweight && ! _required.empty() )
+            _lwcr = cdhash_lightweight_requirement( _required );
         read_console();
     }
 
@@ -135,8 +174,10 @@ namespace usbd
 
     bool macos_policy::prepare( xpc_connection_t peer )
     {
-        if( _o.cdhashes.empty() )
-            return false;
+        // No list: the service is not tied to particular programs, so applications built later use it without an
+        // update of the daemon. Who may use the camera is decided at HELLO (user, session, allowCamera).
+        if( _required.empty() )
+            return true;
         int r = _lwcr ? xpc_connection_set_peer_lightweight_code_requirement( peer, _lwcr )
                       : xpc_connection_set_peer_code_signing_requirement( peer, _requirement.c_str() );
         if( r )
@@ -149,6 +190,10 @@ namespace usbd
 
     rsusb_auth macos_policy::hello( xpc_connection_t peer )
     {
+        // The camera ban first: a user who is not admitted for another reason as well must learn of the ban, so that
+        // an application does not offer its administrator path, which would get around it (DESIGN 13.2.4)
+        if( ! camera_allowed() )
+            return RSUSB_AUTH_CAMERA_DISABLED;
         uid_t euid = xpc_connection_get_euid( peer );
         if( euid != 0 )
         {
@@ -161,34 +206,7 @@ namespace usbd
                 || ! ( attrs & sessionHasGraphicAccess ) || ( attrs & sessionIsRemote ) )
                 return RSUSB_AUTH_USER;
         }
-        return camera_allowed() ? RSUSB_AUTH_OK : RSUSB_AUTH_CAMERA_DISABLED;
-    }
-
-    std::string macos_policy::peer_cdhash( xpc_object_t message )
-    {
-        // The message's audit token identifies the sender (no pid reuse race)
-        SecCodeRef code = nullptr;
-        if( ! message || SecCodeCreateWithXPCMessage( message, kSecCSDefaultFlags, &code ) != errSecSuccess || ! code )
-            return {};
-        CFDictionaryRef info = nullptr;
-        std::string rv;
-        if( SecCodeCopySigningInformation( code, kSecCSDefaultFlags, &info ) == errSecSuccess && info )
-        {
-            CFTypeRef u = CFDictionaryGetValue( info, kSecCodeInfoUnique );
-            if( u && CFGetTypeID( u ) == CFDataGetTypeID() && CFDataGetLength( static_cast< CFDataRef >( u ) ) == 20 )
-            {
-                static const char hex[] = "0123456789abcdef";
-                const UInt8 * b = CFDataGetBytePtr( static_cast< CFDataRef >( u ) );
-                for( int i = 0; i < 20; ++i )
-                {
-                    rv += hex[b[i] >> 4];
-                    rv += hex[b[i] & 15];
-                }
-            }
-            CFRelease( info );
-        }
-        CFRelease( code );
-        return rv;
+        return RSUSB_AUTH_OK;
     }
 
     bool macos_policy::camera_allowed()

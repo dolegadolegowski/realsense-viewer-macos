@@ -89,30 +89,11 @@ namespace usbd
     {
         peer_info p = info( peer );
         std::lock_guard< std::mutex > lock( _mutex );
+        if( ! _camera )   // before the user check, as the real policy (DESIGN 13.2.4)
+            return RSUSB_AUTH_CAMERA_DISABLED;
         if( p.euid != 0 && ( p.euid != _console.uid || _console.uid < 501 || ! p.asid_ok ) )
             return RSUSB_AUTH_USER;
-        return _camera ? RSUSB_AUTH_OK : RSUSB_AUTH_CAMERA_DISABLED;
-    }
-
-    void fake_policy::set_next_peer_cdhash( std::string cdhash )
-    {
-        std::lock_guard< std::mutex > lock( _mutex );
-        _next_cdhash = std::move( cdhash );
-    }
-
-    unsigned fake_policy::peer_cdhash_calls()
-    {
-        std::lock_guard< std::mutex > lock( _mutex );
-        return _cdhash_calls;
-    }
-
-    std::string fake_policy::peer_cdhash( xpc_object_t )
-    {
-        std::lock_guard< std::mutex > lock( _mutex );
-        ++_cdhash_calls;
-        std::string h;
-        h.swap( _next_cdhash );
-        return h;
+        return RSUSB_AUTH_OK;
     }
 
     bool fake_policy::camera_allowed()

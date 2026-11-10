@@ -4,13 +4,15 @@
 #   scripts/build.sh            Release build into ./build
 #   BUILD_TYPE=Debug scripts/build.sh
 #   VIEWER_TESTS=ON scripts/build.sh   also builds realsense-viewer-tests (GUI tests driven by ImGui Test Engine)
-#   scripts/build.sh --asan|--tsan|--fuzz   also builds that variant of the USB broker tests (macos/broker)
+#   scripts/build.sh --asan|--tsan     also builds that sanitizer variant of the camera service tests (macos/broker)
+#   scripts/build.sh --fuzz            accepted for older command lines: the fuzzer rs-usbd-fuzz is always built
 set -euo pipefail
 
 DAEMON_FLAGS=()
 for arg in "$@"; do
     case "$arg" in
-        --asan | --tsan | --fuzz) DAEMON_FLAGS+=("$arg") ;;
+        --asan | --tsan) DAEMON_FLAGS+=("$arg") ;;
+        --fuzz) ;;
         *) echo "usage: $0 [--asan] [--tsan] [--fuzz]" >&2; exit 2 ;;
     esac
 done
@@ -24,14 +26,16 @@ JOBS="$(sysctl -n hw.ncpu)"
 # Keep absolute build paths (and with them the local user name) out of the binaries (__FILE__ in log/assert macros)
 PREFIX_MAP="-ffile-prefix-map=$ROOT=. -ffile-prefix-map=$BUILD=build"
 
-# USB broker checks (macos/broker/DESIGN.md 1.1, 3.7.1, 8.1)
-check_broker_header() {   # the daemon's and librealsense's copy (patch 0002) of the wire protocol must be identical
+# Camera service checks that belong to this build (macos/broker/build-daemon.sh checks its own output as well)
+# check_broker_header runs before the long build: the kit's wire protocol header and the copy that its patch adds to
+# librealsense must be identical
+check_broker_header() {
     if ! cmp -s "$ROOT/macos/broker/rs-usb-broker-protocol.h" "$SRC/src/libusb/broker/rs-usb-broker-protocol.h"; then
         echo "error: macos/broker/rs-usb-broker-protocol.h and its copy in librealsense src/libusb/broker differ" >&2
         return 1
     fi
 }
-check_usbd_hardening() {   # only system libraries, no LC_RPATH
+check_usbd_hardening() {   # the daemon that package.sh ships: only system libraries, no LC_RPATH
     local libs loads
     [ -x "$1" ] || { echo "error: $1 was not built" >&2; return 1; }
     libs="$(otool -L "$1")" && loads="$(otool -l "$1")" || return 1
@@ -44,7 +48,7 @@ check_usbd_hardening() {   # only system libraries, no LC_RPATH
         return 1
     fi
 }
-check_test_hook() {   # rs-usbd-tests drives librealsense's broker client through its internal test hook
+check_test_hook() {   # rs-usbd-tests drives librealsense's camera service client through its internal test hook
     local syms
     syms="$(nm -gU "$1")" || return 1
     if ! grep -q use_endpoint_for_testing <<<"$syms"; then
@@ -62,7 +66,7 @@ for tool in cmake git clang swiftc; do
     command -v "$tool" >/dev/null || { echo "error: '$tool' not found (brew install cmake; xcode-select --install)" >&2; exit 1; }
 done
 
-# librealsense sources + macOS patches
+# librealsense sources + macOS patches (patches/ and the kit's camera service client)
 if [ ! -f "$SRC/CMakeLists.txt" ]; then
     git -C "$ROOT" submodule update --init --depth 1 third_party/librealsense
 fi
@@ -70,8 +74,12 @@ fi
 
 check_broker_header
 
+# CMAKE_DISABLE_FIND_PACKAGE_glfw3: always build the GLFW in the librealsense tree (patched to a shared library that
+# package.sh bundles). A GLFW found on the build machine, from Homebrew for example, would be linked by its absolute
+# path and be missing in the apps.
 cmake -S "$SRC" -B "$BUILD" -G "Unix Makefiles" \
     -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
+    -DCMAKE_DISABLE_FIND_PACKAGE_glfw3=ON \
     -DCMAKE_OSX_ARCHITECTURES=arm64 \
     -DCMAKE_OSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" \
     -DCMAKE_C_FLAGS="$PREFIX_MAP" \
@@ -105,15 +113,21 @@ clang++ -std=c++14 -O2 -arch arm64 -mmacosx-version-min="$DEPLOYMENT_TARGET" $PR
     "$ROOT/tools/selftest/rs-macos-usbdump.cpp" -L"$OUT" -lrealsense2 -Wl,-rpath,@executable_path \
     -o "$OUT/rs-macos-usbdump"
 
-# USB broker daemon realsense-usbd and its host tests (macos/broker/DESIGN.md 8.1). build-daemon.sh reads the same
-# BUILD_DIR / BUILD_TYPE / MACOSX_DEPLOYMENT_TARGET as this script and leaves realsense-usbd in $OUT.
-BUILD_DIR="$BUILD" BUILD_TYPE="$BUILD_TYPE" MACOSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" \
-    "$ROOT/macos/broker/build-daemon.sh" ${DAEMON_FLAGS[@]+"${DAEMON_FLAGS[@]}"}
-check_usbd_hardening "$OUT/realsense-usbd"
+# Camera service daemon realsense-usbd and its host tests. macos/broker is a kit that other applications copy
+# unchanged, so it takes every input as an argument; realsense-usbd is copied next to the tools for package.sh.
 check_test_hook "$OUT/librealsense2.dylib"
+"$ROOT/macos/broker/build-daemon.sh" "$BUILD/usbd" --libusb "$BUILD/libusb_install/lib/libusb-1.0.a" \
+    --librealsense-src "$SRC" --librealsense-lib "$OUT" --deployment-target "$DEPLOYMENT_TARGET" \
+    ${DAEMON_FLAGS[@]+"${DAEMON_FLAGS[@]}"}
+cp -f "$BUILD/usbd/realsense-usbd" "$OUT/realsense-usbd"
+check_usbd_hardening "$OUT/realsense-usbd"
 
 echo
 echo "Build finished: $OUT"
-echo "Run the viewer:     sudo \"$OUT/realsense-viewer\"   (the build tree is not allowlisted for camera access)"
-echo "Hardware self-test: sudo \"$OUT/rs-macos-selftest\""
-echo "Create the apps:    scripts/package.sh"
+echo "Run the viewer:       \"$OUT/realsense-viewer\""
+echo "Hardware self-test:   \"$OUT/rs-macos-selftest\""
+echo "    Both reach the camera through the RealSense camera service when it is installed on this Mac (it admits"
+echo "    programs from the build tree like any other); without the service, run them with sudo."
+echo "Camera service tests: \"$BUILD/usbd/rs-usbd-tests\" && \\"
+echo "                      \"$ROOT/macos/broker/tests/test-camera-access.sh\" \"$OUT/realsense-usbd\""
+echo "Create the apps:      scripts/package.sh"

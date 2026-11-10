@@ -109,6 +109,7 @@ namespace usbd
             // connection queue
             st_t st = st_t::fresh;
             uint64_t gen = 0;
+            uint64_t pv = 0;   // the protocol version agreed at HELLO: what this connection speaks
             std::map< uint64_t, std::shared_ptr< messenger > > handles;
             std::map< uint64_t, std::shared_ptr< request > > requests;
             uint64_t next_h = 1, next_r = 1;
@@ -760,7 +761,10 @@ namespace usbd
             uint64_t pv;
             if( ! get_u64( m, RSUSB_KEY_VERSION, pv ) )
                 return malformed( c, "pv" );
-            rsusb_auth auth = pv != RSUSB_PROTOCOL_VERSION ? RSUSB_AUTH_VERSION : pol->hello( c->peer );
+            // Every protocol version from protocol_min to protocol_max is served and answered with the client's own
+            // pv; any other pv gets AUTH_VERSION and the newest version this daemon speaks (protocol header, HELLO)
+            bool served = pv >= cfg.protocol_min && pv <= cfg.protocol_max;
+            rsusb_auth auth = served ? pol->hello( c->peer ) : RSUSB_AUTH_VERSION;
             if( auth == RSUSB_AUTH_OK )
             {
                 console_state cs = pol->console();
@@ -773,27 +777,25 @@ namespace usbd
                     --new_per_uid[c->euid];
                     c->st = connection::st_t::ready;
                     c->gen = cs.gen;
+                    c->pv = pv;
                 }
             }
             xpc_object_t r = make_reply( c, m );
             if( r )
             {
                 xpc_dictionary_set_int64( r, RSUSB_KEY_STATUS, 0 );
-                xpc_dictionary_set_uint64( r, RSUSB_KEY_VERSION, RSUSB_PROTOCOL_VERSION );
+                xpc_dictionary_set_uint64( r, RSUSB_KEY_VERSION, served ? pv : cfg.protocol_max );
                 xpc_dictionary_set_uint64( r, RSUSB_KEY_AUTH, auth );
-                std::string build = std::to_string( cfg.build_number ) + " " + cfg.build_id.substr( 0, 12 );
+                xpc_dictionary_set_uint64( r, RSUSB_KEY_SERVICE_VERSION, cfg.service_version );
+                std::string build = "realsense-usbd " + std::to_string( cfg.service_version );
                 xpc_dictionary_set_string( r, RSUSB_KEY_BUILD, build.substr( 0, RSUSB_MAX_BUILD_LEN ).c_str() );
                 send( c, r );
                 xpc_release( r );
             }
             uint32_t sup = 0;
             if( auth == RSUSB_AUTH_OK )
-            {
-                std::string h = pol->peer_cdhash( m );
-                std::string by = h.empty() ? "" : lists_admitting( cfg, h );
-                log_info( "conn", "pid %{public}d uid %{public}d admitted by %{public}s (%{public}s)", c->pid, c->euid,
-                          by.empty() ? "an unknown list" : by.c_str(), c->path.c_str() );
-            }
+                log_info( "conn", "pid %{public}d uid %{public}d admitted (protocol %llu, %{public}s)", c->pid, c->euid,
+                          (unsigned long long)c->pv, c->path.c_str() );
             else if( log_rate( c->pid, "hello", sup ) )
                 log_info( "policy", "pid %{public}d uid %{public}d rejected at HELLO (auth %{public}d, %{public}s, %u suppressed)",
                           c->pid, c->euid, int( auth ), c->path.c_str(), sup );

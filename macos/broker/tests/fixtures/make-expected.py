@@ -3,6 +3,8 @@
 # and the librealsense client: the rs-macos-usbdump text that in-process libusb would print for these devices
 # (enumerator-libusb.cpp get_subdevices, device-libusb.cpp, interface-libusb.cpp, endpoint-libusb.h).
 # Devices the daemon must hide (DESIGN 2.4.1) are dropped first. HW-2 replaces d455.expected.txt with real output.
+#
+#   make-expected.py <librealsense source dir>      (the Intel PID list is read from its D400/D500 headers)
 import plistlib
 import struct
 import sys
@@ -12,9 +14,9 @@ HERE = Path(__file__).parent
 REFUSED = {0x01, 0x02, 0x08, 0x09, 0x0A, 0xE0}
 
 
-def intel_pids():
+def intel_pids(librealsense):
     pids = set()
-    src = HERE.parents[3] / 'third_party/librealsense/src/ds'
+    src = Path(librealsense) / 'src/ds'
     for f in (src / 'd400/d400-private.h', src / 'd500/d500-private.h'):
         for line in f.read_text().splitlines():
             line = line.strip()
@@ -93,7 +95,10 @@ def dump(devices):
 
 
 def main():
-    pids = intel_pids()
+    if len(sys.argv) != 2:
+        print('usage: make-expected.py <librealsense source dir>', file=sys.stderr)
+        return 2
+    pids = intel_pids(sys.argv[1])
     for f in sorted(HERE.glob('*.plist')):
         devices = [d for d in plistlib.loads(f.read_bytes())['Devices'] if allowed(d, pids)]
         devices.sort(key=lambda d: d['RegistryID'])

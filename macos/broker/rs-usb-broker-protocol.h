@@ -1,9 +1,16 @@
 /* License: Apache 2.0. See LICENSE file in root directory.
  *
  * Wire protocol between librealsense's RSUSB broker client (src/libusb/broker/, C++14) and the macOS USB broker
- * daemon realsense-usbd (macos/broker/daemon/, C++17). Plain C so both sides compile the same file; the copy at
- * third_party/librealsense/src/libusb/broker/rs-usb-broker-protocol.h must stay byte-identical (build.sh checks).
- * Normative together with macos/broker/DESIGN.md; where CONTRACT.md disagrees, DESIGN.md section 11 wins.
+ * daemon realsense-usbd (daemon/ next to this file, C++17), the shared RealSense camera service of this Mac: one
+ * daemon serves every application, whatever build or project it comes from (README.md next to this file). Plain C so
+ * both sides compile the same file; the copy the client patch (librealsense/macos-usb-broker.patch) puts at
+ * src/libusb/broker/rs-usb-broker-protocol.h of librealsense must stay byte-identical (the builds check).
+ * Normative together with DESIGN.md; where CONTRACT.md disagrees, DESIGN.md section 11 wins.
+ *
+ * Compatibility (DESIGN 13): applications are never updated together with the daemon, so this protocol only grows.
+ * A change that an existing client or daemon could misread gets a new RSUSB_PROTOCOL_VERSION, and the daemon keeps
+ * serving every version from RSUSB_PROTOCOL_MIN_VERSION on: a newer daemon works with every older application. New
+ * reply keys and new ops that old peers never send or simply ignore need no new version.
  *
  * Transport: libxpc dictionaries on the Mach service RSUSB_SERVICE_NAME (client: XPC_CONNECTION_MACH_SERVICE_PRIVILEGED).
  * Every client request carries RSUSB_KEY_OP and is sent with a reply (xpc_connection_send_message_with_reply) unless
@@ -28,13 +35,20 @@
  * Message schemas ("->" request keys, "<-" reply keys):
  *
  * HELLO: must be the first message on a connection; any other op first, or a second HELLO, cancels the connection.
- *   -> op, pv (client RSUSB_PROTOCOL_VERSION)
- *   <- st (0), pv (daemon RSUSB_PROTOCOL_VERSION), auth (rsusb_auth), build (string, <= RSUSB_MAX_BUILD_LEN, diagnostics)
+ *   -> op, pv (the protocol version the client speaks: its RSUSB_PROTOCOL_VERSION)
+ *   <- st (0), pv, auth (rsusb_auth), build (string, <= RSUSB_MAX_BUILD_LEN, diagnostics),
+ *      sv (the daemon's service version, a number that grows with every release of the daemon; absent from the
+ *      daemons of service version 1, which admitted only the programs of one build)
+ *   A daemon serves every pv from its RSUSB_PROTOCOL_MIN_VERSION to its RSUSB_PROTOCOL_VERSION: for such a pv it
+ *   answers with the same pv and speaks that version on this connection; for any other pv it answers
+ *   auth = RSUSB_AUTH_VERSION with pv = the newest version it speaks (the application then asks for an update of the
+ *   camera service).
  *   The client uses the broker only if st == 0, auth == RSUSB_AUTH_OK and pv == its own RSUSB_PROTOCOL_VERSION.
  *   After auth != OK the daemon answers nothing else and cancels the connection after sending the reply.
- *   A peer that fails the code-signing requirement gets no reply: its messages are dropped and the daemon cancels any
- *   connection still without HELLO after RSUSB_NEW_TIMEOUT_MS, so the client sees XPC_ERROR_CONNECTION_INVALID
- *   (final, no retry) about one second after connecting.
+ *   Only when the administrator restricted the service to a list of programs (optional AllowedCDHashes, DESIGN 13):
+ *   a peer that is not on it gets no reply: its messages are dropped and the daemon cancels any connection still
+ *   without HELLO after RSUSB_NEW_TIMEOUT_MS, so the client sees XPC_ERROR_CONNECTION_INVALID (final, no retry)
+ *   about one second after connecting.
  *
  * ENUMERATE: snapshot of the allowed RealSense devices (DESIGN 2.4.1), sorted by IORegistry entry ID ascending,
  *   served from the daemon's cache (no device I/O).
@@ -128,7 +142,8 @@
 #include <stdint.h>
 
 #define RSUSB_SERVICE_NAME "io.github.dolegadolegowski.realsense-usbd"
-#define RSUSB_PROTOCOL_VERSION 1u
+#define RSUSB_PROTOCOL_VERSION 1u       /* the newest version this file describes; what a client built from it speaks */
+#define RSUSB_PROTOCOL_MIN_VERSION 1u   /* the oldest version a daemon built from it still serves */
 
 /* Keys */
 #define RSUSB_KEY_OP "op"
@@ -137,6 +152,7 @@
 #define RSUSB_KEY_VERSION "pv"
 #define RSUSB_KEY_AUTH "auth"
 #define RSUSB_KEY_BUILD "build"
+#define RSUSB_KEY_SERVICE_VERSION "sv"
 #define RSUSB_KEY_DEVICES "devs"
 #define RSUSB_KEY_TOKEN "tok"
 #define RSUSB_KEY_PATH "path"
@@ -187,7 +203,7 @@ enum rsusb_event
 enum rsusb_auth
 {
     RSUSB_AUTH_OK = 0,
-    RSUSB_AUTH_VERSION = 1,          /* client pv not supported */
+    RSUSB_AUTH_VERSION = 1,          /* client pv is not a version this daemon serves */
     RSUSB_AUTH_USER = 2,             /* not root and not the console user in a local GUI session */
     RSUSB_AUTH_CAMERA_DISABLED = 3,  /* com.apple.applicationaccess allowCamera not true (MDM / Screen Time) */
     RSUSB_AUTH_LIMIT = 4             /* RSUSB_MAX_CLIENTS reached */

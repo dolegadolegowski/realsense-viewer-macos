@@ -4,8 +4,9 @@
 #   dist/RealSense Depth Quality Tool.app
 #   dist/RealSense Tools/          command line tools (rs-enumerate-devices, rs-fw-update, ...) and camera-access/
 #   dist/RealSense-Viewer-<version>-macOS-arm64.dmg
-# Every app and the Tools folder carry the USB broker realsense-usbd, its installer, uninstaller and list tool and
-# the allowlist of this build (macos/broker/DESIGN.md 8.2, 8.3).
+# Every app and the Tools folder carry the shared RealSense camera service: the daemon realsense-usbd, its manifest
+# service.plist and the install / uninstall / ensure scripts (macos/broker, bundle layout in its README.md). The
+# service admits every program of the user at the Mac's screen, so nothing here depends on which tools are packaged.
 #
 #   CLIENT_RUNTIME=1 scripts/package.sh   signs the viewer and the Depth Quality Tool with the hardened runtime
 #                                         (DESIGN 3.7.4; only after the HW-3 soak passed with it)
@@ -19,29 +20,25 @@ OUT="${BUILD_DIR:-$ROOT/build}/${BUILD_TYPE:-Release}"
 DIST="$ROOT/dist"
 DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-27.0}"
 BUNDLE_PREFIX="${BUNDLE_PREFIX:-io.github.dolegadolegowski}"
+KIT="$ROOT/macos/broker"
 USBD_ID=io.github.dolegadolegowski.realsense-usbd
 
 [ -x "$OUT/realsense-viewer" ] || { echo "error: run scripts/build.sh first" >&2; exit 1; }
 [ -x "$OUT/realsense-usbd" ] || { echo "error: $OUT/realsense-usbd missing, run scripts/build.sh first" >&2; exit 1; }
 
 VERSION="$(sed -n 's/^#define RS2_API_MAJOR_VERSION *\([0-9]*\).*/\1/p' "$SRC/include/librealsense2/rs.h").$(sed -n 's/^#define RS2_API_MINOR_VERSION *\([0-9]*\).*/\1/p' "$SRC/include/librealsense2/rs.h").$(sed -n 's/^#define RS2_API_PATCH_VERSION *\([0-9]*\).*/\1/p' "$SRC/include/librealsense2/rs.h")"
-PROTOCOL_VERSION="$(sed -n 's/^#define RSUSB_PROTOCOL_VERSION \([0-9]*\)u*$/\1/p' "$ROOT/macos/broker/rs-usb-broker-protocol.h")"
-[ -n "$PROTOCOL_VERSION" ] || { echo "error: RSUSB_PROTOCOL_VERSION not found" >&2; exit 1; }
 LIBS=(librealsense2.2.58.dylib librealsense2-gl.2.58.dylib libglfw.3.dylib)
 TOOLS=(rs-enumerate-devices rs-fw-update rs-fw-logger rs-terminal rs-data-collect rs-convert rs-record rs-embed
        rs-on-chip-calib rs-rosbag-inspector rs-benchmark rs-macos-selftest rs-macos-usbdump rs-macos-release
        rs-hello-realsense rs-capture rs-depth rs-color rs-infrared rs-motion rs-pointcloud rs-align
        rs-align-advanced rs-multicam rs-measure rs-post-processing rs-record-playback rs-save-to-disk
        rs-sensor-control rs-distance rs-callback rs-hdr)
-# Tools that may use the camera through the broker (DESIGN 8.3.3). Not listed, so still sudo: rs-terminal (raw
-# hardware-monitor commands), tools that open no device, rs-macos-release.
-BROKER_TOOLS=(rs-macos-selftest rs-macos-usbdump rs-enumerate-devices rs-fw-update rs-fw-logger rs-data-collect
-              rs-record rs-on-chip-calib rs-benchmark rs-hello-realsense rs-capture rs-depth rs-color rs-infrared
-              rs-motion rs-pointcloud rs-align rs-align-advanced rs-multicam rs-measure rs-post-processing
-              rs-record-playback rs-save-to-disk rs-sensor-control rs-distance rs-callback rs-hdr)
-BROKER_SCRIPTS=(install-camera-access.sh uninstall-camera-access.sh camera-access-allowlist.sh)
+SERVICE_SCRIPTS=(install-camera-access.sh uninstall-camera-access.sh ensure-camera-access.sh)
+for f in make-service-manifest.sh client/RealSenseCameraAccess.swift "${SERVICE_SCRIPTS[@]}"; do
+    [ -f "$KIT/$f" ] || { echo "error: $KIT/$f missing" >&2; exit 1; }
+done
 
-# cdhash_of <Mach-O>: the arm64 code directory hash the daemon admits (40 lowercase hex)
+# cdhash_of <Mach-O>: its arm64 code directory hash (40 lowercase hex), the form service.plist names the daemon by
 cdhash_of() {
     local h
     h="$(codesign -dvvv --arch arm64 "$1" 2>&1 | sed -n 's/^CDHash=//p')"
@@ -49,46 +46,10 @@ cdhash_of() {
     echo "$h"
 }
 
-# write_allowlist <out.plist> <build number> <daemon> <client>...: DESIGN 5.1, records "<cdhash> <file>" lines in
-# $CDHASH_RECORD for the check after bundle signing
-write_allowlist() {
-    local out="$1" number="$2" daemon="$3" f h daemon_hash sorted build_id
-    shift 3
-    daemon_hash="$(cdhash_of "$daemon")"
-    : >"$CDHASH_RECORD"
-    for f in "$daemon" "$@"; do
-        h="$(cdhash_of "$f")"
-        echo "$h $f" >>"$CDHASH_RECORD"
-    done
-    sorted="$(cut -d' ' -f1 "$CDHASH_RECORD" | LC_ALL=C sort -u)"
-    [ "$(grep -c . <<<"$sorted")" -le 256 ] || { echo "error: more than 256 allowlisted cdhashes" >&2; return 1; }
-    build_id="$(printf '%s' "$sorted" | shasum -a 256 | cut -d' ' -f1)"
-    rm -f "$out"
-    plutil -create xml1 "$out"
-    plutil -insert Version -integer 1 "$out"
-    plutil -insert BuildID -string "$build_id" "$out"
-    plutil -insert BuildNumber -integer "$number" "$out"
-    plutil -insert ProtocolVersion -integer "$PROTOCOL_VERSION" "$out"
-    plutil -insert AllowedCDHashes -array "$out"
-    while read -r h; do plutil -insert AllowedCDHashes -string "$h" -append "$out"; done <<<"$sorted"
-    plutil -insert DaemonCDHash -string "$daemon_hash" "$out"
-    chmod 644 "$out"
-}
-
-# verify_cdhashes: nothing allowlisted changed since write_allowlist
-verify_cdhashes() {
-    local h f
-    while read -r h f; do
-        [ "$(cdhash_of "$f")" = "$h" ] || { echo "error: cdhash of $f changed after the allowlist was written" >&2; return 1; }
-    done <"$CDHASH_RECORD"
-}
-# end of allowlist functions
-
 rm -rf "$DIST"
 mkdir -p "$DIST"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
-CDHASH_RECORD="$WORK/cdhashes.txt"
 
 # Application icon from the librealsense artwork
 ICONSET="$WORK/AppIcon.iconset"
@@ -99,8 +60,18 @@ for s in 16 32 128 256 512; do
 done
 iconutil -c icns "$ICONSET" -o "$WORK/AppIcon.icns"
 
-# Launcher (see macos/launcher/main.swift)
-swiftc -O -target "arm64-apple-macos$DEPLOYMENT_TARGET" "$ROOT/macos/launcher/main.swift" -o "$WORK/launcher"
+# Launcher (see macos/launcher/main.swift), with the camera service client every application compiles in unchanged
+swiftc -O -target "arm64-apple-macos$DEPLOYMENT_TARGET" "$ROOT/macos/launcher/main.swift" \
+    "$KIT/client/RealSenseCameraAccess.swift" -o "$WORK/launcher"
+
+# The camera service, in the kit's packaging order: sign the daemon (hardened runtime, its fixed identifier), then
+# write the manifest that names it by cdhash. Every bundle gets these same two files, and the bundle signatures come
+# last because they seal Resources, where the manifest lies.
+cp "$OUT/realsense-usbd" "$WORK/realsense-usbd"
+chmod 755 "$WORK/realsense-usbd"
+codesign --force --sign - -o runtime -i "$USBD_ID" "$WORK/realsense-usbd"
+"$KIT/make-service-manifest.sh" "$WORK/realsense-usbd" "$WORK/service.plist"
+chmod 644 "$WORK/service.plist"
 
 # Points a Mach-O at the bundled libraries instead of the build tree
 relink() {
@@ -122,19 +93,19 @@ copy_libs() {
     done
 }
 
-# realsense-usbd and the camera access scripts (DESIGN 8.2); the allowlist follows after signing
-copy_broker() {
-    local bin_dir="$1" res_dir="$2"
-    cp "$OUT/realsense-usbd" "$bin_dir/realsense-usbd"
-    chmod 755 "$bin_dir/realsense-usbd"
-    mkdir -p "$res_dir"
-    for s in "${BROKER_SCRIPTS[@]}"; do
-        cp "$ROOT/macos/broker/$s" "$res_dir/$s"
+# copy_camera_service <dir for realsense-usbd> <dir for service.plist and the scripts>
+copy_camera_service() {
+    local bin_dir="$1" res_dir="$2" s
+    mkdir -p "$bin_dir" "$res_dir"
+    cp "$WORK/realsense-usbd" "$bin_dir/realsense-usbd"
+    cp "$WORK/service.plist" "$res_dir/service.plist"
+    for s in "${SERVICE_SCRIPTS[@]}"; do
+        cp "$KIT/$s" "$res_dir/$s"
         chmod 755 "$res_dir/$s"
     done
 }
 
-# 1. Assemble both apps and the Tools folder, unsigned
+# 1. Assemble both apps and the Tools folder; only the daemon is signed so far
 make_app() {
     local name="$1" target="$2" id="$3" summary="$4"
     local app="$DIST/$name.app"
@@ -143,7 +114,7 @@ make_app() {
     cp "$OUT/$target" "$app/Contents/MacOS/$target"
     cp "$OUT/rs-macos-release" "$app/Contents/MacOS/rs-macos-release"
     cp "$OUT/rs-macos-handback" "$app/Contents/MacOS/rs-macos-handback"
-    copy_broker "$app/Contents/MacOS" "$app/Contents/Resources/realsense-usbd"
+    copy_camera_service "$app/Contents/MacOS" "$app/Contents/Resources/realsense-usbd"
     relink "$app/Contents/MacOS/$target" "@executable_path/../Frameworks"
     copy_libs "$app/Contents/Frameworks"
     cp "$WORK/AppIcon.icns" "$app/Contents/Resources/AppIcon.icns"
@@ -188,41 +159,46 @@ for t in "${TOOLS[@]}"; do
     cp "$OUT/$t" "$TOOLS_DIR/bin/$t"
     relink "$TOOLS_DIR/bin/$t" "@executable_path/../lib"
 done
-copy_broker "$TOOLS_DIR/camera-access" "$TOOLS_DIR/camera-access"
+copy_camera_service "$TOOLS_DIR/camera-access" "$TOOLS_DIR/camera-access"
 cat > "$TOOLS_DIR/README.txt" <<TXT
 RealSense command line tools $VERSION for Apple Silicon macOS.
 
-Camera access (recommended)
----------------------------
-macOS only lets root take a camera over from its USB video driver. "Camera access" is a small system service
-(realsense-usbd) that does this for the RealSense Viewer, the Depth Quality Tool and the tools below, so they run
-without sudo and without a password, also on standard accounts. An administrator installs it once, either
+RealSense camera service
+------------------------
+macOS only lets root take a camera over from its USB video driver. The RealSense camera service (realsense-usbd, a
+small system service) does this for every RealSense application of this Mac: RealSense Viewer, the Depth Quality
+Tool, the tools below and other applications built for it, such as IntelFaceScan. With it they run without sudo and
+without a password, also on standard accounts. It is installed once per Mac and does not belong to one DMG or one
+application:
 
-  * by opening RealSense Viewer (copied to /Applications) and clicking "Install camera access for all users", or
-  * from this folder:  sudo "./camera-access/install-camera-access.sh" --source "./camera-access"
-    (run it from a copy in an administrator's folder or from the DMG an administrator opened; it refuses files
-    other users could have changed).
+  * RealSense Viewer installs it at its first start (the macOS administrator prompt, once), or
+  * from this folder, as the user logged in at the Mac's screen:  ./camera-access/ensure-camera-access.sh
+    (asks the service whether it answers and shows the administrator prompt only when it has to be installed), or
+  * as root, for example over SSH:  sudo ./camera-access/install-camera-access.sh --source ./camera-access
+
+The installer refuses files that other users could have changed: run it from a copy in a folder that only
+administrators can change, or from the DMG an administrator opened. It never replaces a newer service with an
+older one, so it does not matter which application installs it first.
 
 Afterwards no sudo and no password are needed, e.g.:
     ./bin/rs-enumerate-devices
     ./bin/rs-macos-selftest
     ./bin/rs-fw-update -l
+    ./bin/rs-terminal
 
-The apps and these tools must come from the same DMG: camera access only admits the programs of the build it
-was installed from. Installing camera access from a newer DMG replaces it; then update the apps as well.
-To remove it:  sudo "./camera-access/uninstall-camera-access.sh"
+Is it installed and answering?  ./camera-access/ensure-camera-access.sh --check
+    (prints "ok <service version>" and exits 0 when it is; exit status 10 means not installed)
+To remove it:  sudo ./camera-access/uninstall-camera-access.sh
+    (for every RealSense application of this Mac; each of them offers to install it again)
 
-Other apps (e.g. IntelFaceScan) can be given camera access by an administrator with camera-access-allowlist.sh;
-they ask for it themselves. Updating camera access keeps their lists, removing it removes them too.
-
-Without camera access
----------------------
-Run the tools with sudo, e.g. "sudo ./bin/rs-enumerate-devices". rs-terminal always needs sudo. After a tool ran
-with sudo the camera stays detached from macOS; "sudo ./bin/rs-macos-release" (or re-plugging it) gives it back
-to macOS, e.g. to use the RGB camera as a webcam.
+Without the camera service
+--------------------------
+Run the tools with sudo, e.g. "sudo ./bin/rs-enumerate-devices". After a tool ran with sudo the camera stays
+detached from macOS; "sudo ./bin/rs-macos-release" (or re-plugging it) gives it back to macOS, e.g. to use the RGB
+camera as a webcam.
 TXT
 
-# 2. Sign every nested Mach-O (ad-hoc; the daemon with the hardened runtime and its fixed identifier)
+# 2. Sign every nested Mach-O (ad-hoc). realsense-usbd keeps the signature the manifest names.
 cat > "$WORK/client.entitlements" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -234,7 +210,7 @@ sign_nested() {
         case "$(file -b "$f")" in Mach-O*) ;; *) continue ;; esac
         local opts=()
         case "$(basename "$f")" in
-            realsense-usbd) opts=(-o runtime -i "$USBD_ID") ;;
+            realsense-usbd) continue ;;
             realsense-viewer | rs-depth-quality)
                 if [ "${CLIENT_RUNTIME:-0}" = 1 ]; then opts=(-o runtime --entitlements "$WORK/client.entitlements"); fi ;;
         esac
@@ -245,32 +221,30 @@ sign_nested "$VIEWER_APP/Contents"
 sign_nested "$DQT_APP/Contents"
 sign_nested "$TOOLS_DIR"
 
-# 3./4. Allowlist of this build, identical in both apps and the Tools folder
-CLIENTS=("$VIEWER_APP/Contents/MacOS/realsense-viewer" "$DQT_APP/Contents/MacOS/rs-depth-quality"
-         "$DQT_APP/Contents/MacOS/realsense-usbd" "$TOOLS_DIR/camera-access/realsense-usbd")
-for t in "${BROKER_TOOLS[@]}"; do
-    if [ -x "$TOOLS_DIR/bin/$t" ]; then CLIENTS+=("$TOOLS_DIR/bin/$t"); fi
-done
-write_allowlist "$WORK/allowlist.plist" "$(date -u +%Y%m%d%H%M)" "$VIEWER_APP/Contents/MacOS/realsense-usbd" "${CLIENTS[@]}"
-DAEMON_HASHES="$(grep '/realsense-usbd$' "$CDHASH_RECORD" | cut -d' ' -f1 | sort -u | wc -l | tr -d ' ')"
-[ "$DAEMON_HASHES" = 1 ] || { echo "error: the realsense-usbd copies differ" >&2; exit 1; }
-for dir in "$VIEWER_APP/Contents/Resources/realsense-usbd" "$DQT_APP/Contents/Resources/realsense-usbd" \
-           "$TOOLS_DIR/camera-access"; do
-    cp "$WORK/allowlist.plist" "$dir/allowlist.plist"
-done
-
-# 5. Sign the bundles (seals Resources incl. the allowlist), verify, and prove the allowlisted code is unchanged
+# 3. Sign the bundles (seals Resources incl. the manifest) and verify them
 for app in "$VIEWER_APP" "$DQT_APP"; do
     codesign --force --sign - "$app"
     codesign --verify --strict --deep "$app"
-    cmp -s "$WORK/allowlist.plist" "$app/Contents/Resources/realsense-usbd/allowlist.plist" \
-        || { echo "error: allowlist in $app differs" >&2; exit 1; }
     echo "created $app"
 done
-cmp -s "$WORK/allowlist.plist" "$TOOLS_DIR/camera-access/allowlist.plist" \
-    || { echo "error: allowlist in $TOOLS_DIR differs" >&2; exit 1; }
-verify_cdhashes
-echo "allowlisted $(plutil -extract AllowedCDHashes raw "$WORK/allowlist.plist") cdhashes, build $(plutil -extract BuildNumber raw "$WORK/allowlist.plist")"
+
+# 4. Every copy of the daemon is still the one the manifest names, and every manifest is the one written above
+DAEMON_CDHASH="$(plutil -extract DaemonCDHash raw -expect string "$WORK/service.plist")"
+BIN_DIRS=("$VIEWER_APP/Contents/MacOS" "$DQT_APP/Contents/MacOS" "$TOOLS_DIR/camera-access")
+RES_DIRS=("$VIEWER_APP/Contents/Resources/realsense-usbd" "$DQT_APP/Contents/Resources/realsense-usbd"
+          "$TOOLS_DIR/camera-access")
+for i in 0 1 2; do
+    bin_dir="${BIN_DIRS[$i]}"
+    res_dir="${RES_DIRS[$i]}"
+    codesign --verify --strict "$bin_dir/realsense-usbd"
+    [ "$(cdhash_of "$bin_dir/realsense-usbd")" = "$DAEMON_CDHASH" ] \
+        || { echo "error: $bin_dir/realsense-usbd is not the daemon service.plist names" >&2; exit 1; }
+    cmp -s "$WORK/service.plist" "$res_dir/service.plist" \
+        || { echo "error: $res_dir/service.plist differs from the manifest of this build" >&2; exit 1; }
+done
+manifest_value() { plutil -extract "$1" raw -expect integer "$WORK/service.plist"; }
+echo "camera service version $(manifest_value ServiceVersion)," \
+    "protocol $(manifest_value ProtocolMin)-$(manifest_value ProtocolMax), daemon cdhash $DAEMON_CDHASH"
 
 # Disk image
 STAGE="$WORK/dmg"

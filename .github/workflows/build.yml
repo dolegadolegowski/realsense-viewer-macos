@@ -24,6 +24,12 @@ jobs:
       - name: Build
         run: scripts/build.sh
 
+      # Host tests of the camera service kit (macos/broker): no camera, no root, nothing is installed
+      - name: Test the camera service
+        run: |
+          build/usbd/rs-usbd-tests
+          macos/broker/tests/test-camera-access.sh build/Release/realsense-usbd
+
       - name: Package
         run: scripts/package.sh
 
