@@ -1,9 +1,12 @@
 // License: Apache 2.0. See LICENSE file in root directory.
-// realsense-usbd: RealSense USB broker for macOS (DESIGN 2.1).
+// realsense-usbd: the shared RealSense camera service of a Mac, a USB broker for librealsense (DESIGN 2.1, 13).
 //
 //   realsense-usbd --daemon               launchd only (root, ppid 1, installed path, valid config)
-//   realsense-usbd --probe                any user: HELLO as a client; exit 0 OK, 2 unreachable/rejected, 3 AUTH_USER,
-//                                         4 AUTH_CAMERA_DISABLED, 5 AUTH_VERSION, 6 AUTH_LIMIT
+//   realsense-usbd --probe                any user: HELLO as a client against the installed service; prints one line
+//                                         ("ok <service version>" or the reason); exit 0 OK, 2 unreachable/rejected,
+//                                         3 AUTH_USER, 4 AUTH_CAMERA_DISABLED, 5 AUTH_VERSION, 6 AUTH_LIMIT
+//   realsense-usbd --version              any user: "realsense-usbd <service version> protocol <min>-<max>" of this
+//                                         binary; touches nothing (make-service-manifest.sh reads it)
 //   realsense-usbd --dump                 any user: the ENUMERATE snapshot as a fixture plist (no device is opened)
 //   realsense-usbd --handback-recorded    root, daemon stopped: hands recorded captured devices back to macOS
 
@@ -13,7 +16,9 @@
 #include "core/xpc-util.h"
 #include "handback.h"
 #include "policy-macos.h"
+#include "probe.h"
 #include "rs-usb-broker-protocol.h"
+#include "version.h"
 
 #include <libproc.h>
 #include <signal.h>
@@ -58,22 +63,6 @@ namespace
         std::string error;
         if( ! load_config( CONFIG_PATH, true, cfg, error ) )
             return refuse( ( "configuration: " + error ).c_str() );
-        // Lists of other projects (5.5): an invalid one is skipped, never stops the daemon
-        std::vector< std::string > problems;
-        apply_extra_lists( cfg, load_extra_lists( EXTRA_DIR, true, problems ), problems );
-        for( auto & pr : problems )
-            log_fault( "policy", "allowlist %{public}s skipped", pr.c_str() );
-        log_info( "policy", "allowlist usbd.plist: build %{public}lld, %{public}zu code hashes", (long long)cfg.build_number,
-                  cfg.cdhashes.size() );
-        for( auto & l : cfg.extra_lists )
-        {
-            log_info( "policy", "allowlist usbd.d/%{public}s: build %{public}lld, %{public}zu code hashes", l.name.c_str(),
-                      (long long)l.build_number, l.cdhashes.size() );
-            if( l.protocol != RSUSB_PROTOCOL_VERSION )
-                log_info( "policy", "allowlist usbd.d/%{public}s: made for protocol %{public}lld, its programs get AUTH_VERSION",
-                          l.name.c_str(), (long long)l.protocol );
-        }
-        log_info( "policy", "admitting %{public}zu code hashes", cfg.admitted_cdhashes.size() );
 
         paths p;
         state_store lock_store( p );
@@ -84,14 +73,30 @@ namespace
         if( ! backend->ok() )
             return refuse( "libusb_init failed" );
         macos_policy_options po;
-        po.cdhashes = cfg.admitted_cdhashes;
+        po.cdhashes = cfg.cdhashes;
+        if( ! cfg.cdhashes.empty() )
+        {
+            // The installer verifies an installation with this binary's own --probe (as root): it is admitted
+            // whatever the administrator listed
+            po.daemon_cdhash = running_cdhash();
+            if( po.daemon_cdhash.empty() )
+                log_fault( "policy", "cannot read this daemon's own cdhash: its --probe is admitted only if "
+                                     "AllowedCDHashes lists it" );
+        }
         po.queue = dispatch_get_main_queue();
         auto * core = new usbd_core( std::move( backend ), std::make_unique< macos_policy >( po ), cfg, timing::from( cfg ), p );
         core->start( true );
         xpc_connection_t listener = xpc_connection_create_mach_service( RSUSB_SERVICE_NAME, dispatch_get_main_queue(),
                                                                         XPC_CONNECTION_MACH_SERVICE_LISTENER );
         core->attach_listener( listener );
-        log_info( "conn", "realsense-usbd started (build %{public}lld)", (long long)cfg.build_number );
+        if( cfg.cdhashes.empty() )
+            log_info( "conn", "realsense-usbd %d started (protocol %u-%u, not restricted to particular programs)",
+                      RSUSBD_SERVICE_VERSION, RSUSB_PROTOCOL_MIN_VERSION, RSUSB_PROTOCOL_VERSION );
+        else
+            log_info( "conn", "realsense-usbd %d started (protocol %u-%u, restricted to %zu programs by "
+                              "AllowedCDHashes%{public}s)",
+                      RSUSBD_SERVICE_VERSION, RSUSB_PROTOCOL_MIN_VERSION, RSUSB_PROTOCOL_VERSION, cfg.cdhashes.size(),
+                      po.daemon_cdhash.empty() ? "" : "; this daemon's own --probe is admitted as well" );
 
         signal( SIGTERM, SIG_IGN );
         dispatch_source_t term = dispatch_source_create( DISPATCH_SOURCE_TYPE_SIGNAL, SIGTERM, 0, dispatch_get_main_queue() );
@@ -127,7 +132,7 @@ namespace
     {
         dispatch_queue_t q = dispatch_queue_create( "probe", DISPATCH_QUEUE_SERIAL );
         uint64_t deadline = now_ms() + RSUSB_HELLO_TIMEOUT_MS;
-        for( int attempt = 0; attempt < 4; ++attempt )
+        for( int attempt = 0;; ++attempt )   // probe_attempt ends it, after PROBE_ATTEMPTS at the latest
         {
             xpc_connection_t c = xpc_connection_create_mach_service( RSUSB_SERVICE_NAME, q, XPC_CONNECTION_MACH_SERVICE_PRIVILEGED );
             xpc_connection_set_event_handler( c, ^( xpc_object_t ) {} );
@@ -146,31 +151,12 @@ namespace
             bool got = now < deadline
                     && dispatch_semaphore_wait( sem, dispatch_time( DISPATCH_TIME_NOW, int64_t( deadline - now ) * NSEC_PER_MSEC ) ) == 0;
             xpc_connection_cancel( c );
-            if( ! got )
-                return printf( "unreachable: no answer\n" ), 2;
-            if( reply == XPC_ERROR_CONNECTION_INTERRUPTED && now_ms() < deadline )
+            std::string line;
+            int status = probe_attempt( got ? reply : nullptr, RSUSB_PROTOCOL_VERSION, attempt, now_ms() < deadline, line );
+            if( status == PROBE_AGAIN )
                 continue;
-            if( xpc_get_type( reply ) != XPC_TYPE_DICTIONARY )
-                return printf( "unreachable: not installed, turned off, or this build is not allowlisted\n" ), 2;
-            int64_t st;
-            uint64_t pv, auth;
-            xpc_object_t b = get_typed( reply, RSUSB_KEY_BUILD, XPC_TYPE_STRING );
-            if( ! get_i64( reply, RSUSB_KEY_STATUS, st ) || ! get_u64( reply, RSUSB_KEY_VERSION, pv ) || ! get_u64( reply, RSUSB_KEY_AUTH, auth ) || st != 0 )
-                return printf( "rejected: invalid reply\n" ), 2;
-            switch( auth )
-            {
-            case RSUSB_AUTH_OK:
-                if( pv != RSUSB_PROTOCOL_VERSION )
-                    return printf( "protocol version %llu\n", (unsigned long long)pv ), 5;
-                return printf( "ok %s\n", b ? xpc_string_get_string_ptr( b ) : "" ), 0;
-            case RSUSB_AUTH_USER: return printf( "not the console user\n" ), 3;
-            case RSUSB_AUTH_CAMERA_DISABLED: return printf( "camera disabled by policy\n" ), 4;
-            case RSUSB_AUTH_VERSION: return printf( "protocol version %llu\n", (unsigned long long)pv ), 5;
-            case RSUSB_AUTH_LIMIT: return printf( "too many clients\n" ), 6;
-            default: return printf( "rejected: auth %llu\n", (unsigned long long)auth ), 2;
-            }
+            return printf( "%s\n", line.c_str() ), status;
         }
-        return printf( "unreachable: interrupted\n" ), 2;
     }
 
     int run_dump()
@@ -255,10 +241,13 @@ int main( int argc, char ** argv )
         return run_daemon();
     if( mode == "--probe" )
         return run_probe();
+    if( mode == "--version" )
+        return printf( "realsense-usbd %d protocol %u-%u\n", RSUSBD_SERVICE_VERSION, RSUSB_PROTOCOL_MIN_VERSION,
+                       RSUSB_PROTOCOL_VERSION ), 0;
     if( mode == "--dump" )
         return run_dump();
     if( mode == "--handback-recorded" )
         return run_handback_recorded();
-    fprintf( stderr, "usage: realsense-usbd --daemon | --probe | --dump | --handback-recorded\n" );
+    fprintf( stderr, "usage: realsense-usbd --daemon | --probe | --version | --dump | --handback-recorded\n" );
     return 64;
 }

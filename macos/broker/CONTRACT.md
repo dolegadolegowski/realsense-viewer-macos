@@ -5,6 +5,11 @@ behaves exactly as it does with the in-process libusb path. All paths below are 
 `third_party/librealsense/` unless they start with `libusb/` (= `build/third-party/libusb/libusb/libusb/`) or
 `tools/` / `macos/` (= repo root). Line numbers refer to the working tree with the port patch applied.
 
+This document was written in and for the realsense-viewer-macos repository, and its paths are that repository's. In
+a copy of this folder elsewhere they do not exist; the contract itself does not depend on them. The client it
+describes is `librealsense/macos-usb-broker.patch` next to this document, and the build is `build-daemon.sh`. Who
+may use the broker and how versions are negotiated changed with the shared camera service: DESIGN.md section 13.
+
 Terms: **client** = the librealsense code in the viewer process. **broker** = the root daemon. **messenger** =
 `usb_messenger` (one per `usb_device::open()`). **request** = `usb_request` (one async bulk/interrupt transfer slot).
 
@@ -400,7 +405,7 @@ endif()
 ```
 
 - Keep the wire-protocol header in one place both sides compile (e.g. inside src/libusb/broker/, included by the
-  daemon's build via an include path) so the patch in patches/ stays self-contained.
+  daemon's build via an include path) so the patch (now `librealsense/macos-usb-broker.patch`) stays self-contained.
 - Static libusb for the daemon: build/libusb_install/lib/libusb-1.0.a, headers
   build/libusb_install/include/libusb-1.0 (libusb 1.0.30 sources at
   build/third-party/libusb/libusb/libusb).

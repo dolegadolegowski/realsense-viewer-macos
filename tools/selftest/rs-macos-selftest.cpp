@@ -333,8 +333,8 @@ try
             seconds = std::atof( argv[i] );
     std::printf( "RealSense macOS self-test (librealsense %s, euid=%d)\n", RS2_API_FULL_VERSION_STR, (int)geteuid() );
     if( geteuid() != 0 )
-        std::printf( "Not running as root: the camera is reached through RealSense camera access (realsense-usbd) if it is\n"
-                     "installed, otherwise this needs sudo\n" );
+        std::printf( "Not running as root: the camera is reached through the RealSense camera service (realsense-usbd) if\n"
+                     "it is installed, otherwise this needs sudo\n" );
 
     rs2::log_to_console( RS2_LOG_SEVERITY_WARN );
     rs2::context ctx;

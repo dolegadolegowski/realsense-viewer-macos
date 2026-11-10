@@ -1,6 +1,7 @@
 // License: Apache 2.0. See LICENSE file in root directory.
-// Host tests of realsense-usbd's core against the mock backend and the fake policy (DESIGN 9.1 H2, H4 daemon side).
-// Every case runs in its own child process.
+// Host tests of realsense-usbd's core against the mock backend and the fake policy (DESIGN 9.1 H2, H4 daemon side);
+// one case puts the real policy (daemon/policy-macos) behind the core. Every case runs in its own child process.
+// --fixtures defaults to the tests/fixtures folder next to the sources this binary was built from.
 //
 //   rs-usbd-tests [--fixtures <dir>] [--jobs N]          run every case
 //   rs-usbd-tests [--fixtures <dir>] --case <name>       run one case in this process
@@ -12,6 +13,9 @@
 #include "daemon/core/hwm.h"
 #include "daemon/core/server.h"
 #include "daemon/core/xpc-util.h"
+#include "daemon/policy-macos.h"
+#include "daemon/probe.h"
+#include "daemon/version.h"
 #include "backend-mock.h"
 #include "policy-fake.h"
 #include "rs-usb-broker-protocol.h"
@@ -23,6 +27,7 @@
 #include <librealsense2/rs.h>
 #endif
 
+#include <limits.h>
 #include <mach-o/dyld.h>
 #include <signal.h>
 #include <spawn.h>
@@ -30,6 +35,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -66,9 +72,13 @@ extern char ** environ;
         }                                                                                                              \
     } while( 0 )
 
+#ifndef RSUSBD_FIXTURES
+#define RSUSBD_FIXTURES "tests/fixtures"   // build-daemon.sh passes the absolute path
+#endif
+
 namespace
 {
-    std::string g_fixtures = "macos/broker/tests/fixtures";
+    std::string g_fixtures = RSUSBD_FIXTURES;
 
     void sleep_ms( unsigned ms ) { usleep( ms * 1000 ); }
 
@@ -99,15 +109,7 @@ namespace
         return rv;
     }
 
-    config test_config()
-    {
-        config c;
-        c.build_id = std::string( 64, 'a' );
-        c.build_number = 202611041200;
-        c.cdhashes = { std::string( 40, '0' ) };
-        c.daemon_cdhash = c.cdhashes[0];
-        return c;
-    }
+    config test_config() { return config(); }   // the defaults: no AllowedCDHashes, this build's versions
 
     timing fast()
     {
@@ -120,19 +122,15 @@ namespace
         return t;
     }
 
-    // $TMPDIR (per-user on macOS), else /private/tmp; by its real path, because the config loaders refuse symlinked
-    // parents and macOS's $TMPDIR is below the /var symlink
-    std::string temp_base()
+    std::string temp_base()   // $TMPDIR (per-user on macOS), else /private/tmp
     {
         const char * t = getenv( "TMPDIR" );
         std::string b = t && *t ? t : "/private/tmp";
-        if( char * r = realpath( b.c_str(), nullptr ) )
-        {
-            b = r;
-            free( r );
-        }
         while( b.size() > 1 && b.back() == '/' )
             b.pop_back();
+        char real[PATH_MAX];
+        if( realpath( b.c_str(), real ) )   // /var is a symlink, and load_config refuses a path through one
+            b = real;
         return b;
     }
 
@@ -146,7 +144,7 @@ namespace
     struct env
     {
         mock_backend * mock;
-        fake_policy * pol;
+        fake_policy * pol;   // nullptr when the case brought its own policy
         usbd_core * core;
         xpc_connection_t listener;
         xpc_endpoint_t endpoint;
@@ -158,15 +156,17 @@ namespace
         {
         }
 
-        env( std::vector< fixture_device > devices, timing t, config c, std::function< void( env & ) > before_start )
+        // `policy`: used instead of the fake one (the core owns it)
+        env( std::vector< fixture_device > devices, timing t, config c, std::function< void( env & ) > before_start,
+             peer_policy * policy = nullptr )
         {
             mock = new mock_backend( std::move( devices ) );
-            pol = new fake_policy;
+            pol = policy ? nullptr : new fake_policy;
             paths p;
             state = temp_dir() + "/state";
             p.state_dir = state;
             p.require_root = false;
-            core = new usbd_core( std::unique_ptr< usb_backend >( mock ), std::unique_ptr< peer_policy >( pol ), c, t, p );
+            core = new usbd_core( std::unique_ptr< usb_backend >( mock ), std::unique_ptr< peer_policy >( policy ? policy : pol ), c, t, p );
             if( before_start )
                 before_start( *this );
             core->start( false );
@@ -283,17 +283,34 @@ namespace
             return p;
         }
 
-        uint64_t hello( uint64_t pv = RSUSB_PROTOCOL_VERSION )
+        struct hello_reply
         {
+            uint64_t auth = 1000, pv = 0, sv = 0;   // auth 1000: no reply (connection error)
+            std::string build;
+        };
+
+        // Every HELLO reply, whatever its auth: pv is the client's own unless the daemon does not serve that
+        // version, sv is there, and build names the service version
+        hello_reply hello_full( uint64_t pv = RSUSB_PROTOCOL_VERSION )
+        {
+            hello_reply h;
             xpc_object_t r = call( dict( { { RSUSB_KEY_OP, RSUSB_OP_HELLO }, { RSUSB_KEY_VERSION, pv } } ) );
-            if( status( r ) != 0 )
-                return 1000;
-            uint64_t a = u64( r, RSUSB_KEY_AUTH );
-            CHECK_EQ( u64( r, RSUSB_KEY_VERSION ), RSUSB_PROTOCOL_VERSION );
-            CHECK( get_typed( r, RSUSB_KEY_BUILD, XPC_TYPE_STRING ) );
+            if( status( r ) == 0 )
+            {
+                h.auth = u64( r, RSUSB_KEY_AUTH );
+                h.pv = u64( r, RSUSB_KEY_VERSION );
+                h.sv = u64( r, RSUSB_KEY_SERVICE_VERSION );
+                xpc_object_t b = get_typed( r, RSUSB_KEY_BUILD, XPC_TYPE_STRING );
+                CHECK( b );
+                h.build = xpc_string_get_string_ptr( b );
+                CHECK( h.auth == RSUSB_AUTH_VERSION ? h.pv != pv : h.pv == pv );
+                CHECK( h.build == "realsense-usbd " + std::to_string( h.sv ) && h.build.size() <= RSUSB_MAX_BUILD_LEN );
+            }
             xpc_release( r );
-            return a;
+            return h;
         }
+
+        uint64_t hello( uint64_t pv = RSUSB_PROTOCOL_VERSION ) { return hello_full( pv ).auth; }
 
         int64_t lease( uint64_t tok ) { return st( dict( { { RSUSB_KEY_OP, RSUSB_OP_LEASE }, { RSUSB_KEY_TOKEN, tok } } ) ); }
 
@@ -505,16 +522,73 @@ namespace
     CASE( hello_ok )
     {
         env e( { "d455.plist" } );
-        client a( e );
+        client a( e, false );
+        auto h = a.hello_full();
+        CHECK_EQ( h.auth, RSUSB_AUTH_OK );
+        CHECK_EQ( h.pv, RSUSB_PROTOCOL_VERSION );
+        CHECK_EQ( h.sv, RSUSBD_SERVICE_VERSION );
+        CHECK( h.build == "realsense-usbd " + std::to_string( RSUSBD_SERVICE_VERSION ) );
         CHECK_EQ( e.core->stats().ready, 1 );
     }
 
     CASE( hello_wrong_version )
     {
+        // A pv this daemon does not serve (above its newest, below its oldest): AUTH_VERSION with the newest pv it
+        // speaks, the service version as in every reply, then the connection is cancelled
         env e( { "d455.plist" } );
-        client a( e, false );
-        CHECK_EQ( a.hello( 99 ), RSUSB_AUTH_VERSION );
-        CHECK( a.wait_invalid( 1000 ) );
+        const uint64_t unserved[] = { RSUSB_PROTOCOL_VERSION + 1u, 99, RSUSB_PROTOCOL_MIN_VERSION - 1u, ~uint64_t( 0 ) };
+        for( uint64_t pv : unserved )
+        {
+            client a( e, false );
+            auto h = a.hello_full( pv );
+            CHECK_EQ( h.auth, RSUSB_AUTH_VERSION );
+            CHECK_EQ( h.pv, RSUSB_PROTOCOL_VERSION );
+            CHECK_EQ( h.sv, RSUSBD_SERVICE_VERSION );
+            CHECK( a.wait_invalid( 1000 ) );
+        }
+        CHECK_EQ( e.core->stats().ready, 0 );
+    }
+
+    CASE( hello_version_range )
+    {
+        // A daemon that serves protocol versions 2..4 (service version 7; both come from the core's configuration):
+        // a served pv is echoed, so every client is answered in its own version; any other pv is told the newest one
+        config c = test_config();
+        c.protocol_min = 2;
+        c.protocol_max = 4;
+        c.service_version = 7;
+        env e( { "d455.plist" }, fast(), c );
+        for( uint64_t pv = 2; pv <= 4; ++pv )
+        {
+            client a( e, false );
+            auto h = a.hello_full( pv );
+            CHECK_EQ( h.auth, RSUSB_AUTH_OK );
+            CHECK_EQ( h.pv, pv );
+            CHECK_EQ( h.sv, 7 );
+            CHECK( h.build == "realsense-usbd 7" );
+            CHECK_EQ( a.enumerate().size(), 1 );   // admitted: the connection is READY
+        }
+        const uint64_t unserved[] = { 0, 1, 5, 99 };
+        for( uint64_t pv : unserved )
+        {
+            client a( e, false );
+            auto h = a.hello_full( pv );
+            CHECK_EQ( h.auth, RSUSB_AUTH_VERSION );
+            CHECK_EQ( h.pv, 4 );
+            CHECK_EQ( h.sv, 7 );
+            CHECK( a.wait_invalid( 1000 ) );
+        }
+        // a served pv from a user who is not admitted: AUTH_USER, still with the client's pv and the service version
+        e.pol->set_next_peer( 502, true );
+        client other( e, false );
+        auto h = other.hello_full( 3 );
+        CHECK_EQ( h.auth, RSUSB_AUTH_USER );
+        CHECK_EQ( h.pv, 3 );
+        CHECK_EQ( h.sv, 7 );
+        // an unserved pv is answered AUTH_VERSION before the user is looked at
+        e.pol->set_next_peer( 502, true );
+        client old( e, false );
+        CHECK_EQ( old.hello( 1 ), RSUSB_AUTH_VERSION );
     }
 
     CASE( hello_rules )
@@ -570,8 +644,9 @@ namespace
 
     CASE( new_timeout_and_signature_reject )
     {
-        // As libxpc does for a peer failing the code-signing requirement (H6): its messages are dropped, so the
-        // reply right dies (client: INTERRUPTED at once) and the NEW timeout removes the connection.
+        // Only when the administrator restricted the service to a list of programs (AllowedCDHashes). As libxpc does
+        // for a peer failing the code-signing requirement (H6): its messages are dropped, so the reply right dies
+        // (client: INTERRUPTED at once) and the NEW timeout removes the connection.
         env e( { "d455.plist" } );
         e.pol->set_reject_signature( true );
         client a( e, false );
@@ -642,6 +717,219 @@ namespace
         client cam( e, false );
         CHECK_EQ( cam.hello(), RSUSB_AUTH_CAMERA_DISABLED );
         CHECK( cam.wait_invalid( 1000 ) );
+        // the ban is answered before the user check: a user who is not at the screen learns of it too (13.2.4)
+        e.pol->set_next_peer( 502, true );
+        client banned_other_user( e, false );
+        CHECK_EQ( banned_other_user.hello(), RSUSB_AUTH_CAMERA_DISABLED );
+    }
+
+    CASE( probe_lines )
+    {
+        // What `realsense-usbd --probe` prints and exits with for the core's own HELLO replies (daemon/probe.h)
+        auto probe = []( env & e, uint64_t pv, std::string & line ) {
+            client a( e, false );
+            xpc_object_t r = a.call( dict( { { RSUSB_KEY_OP, RSUSB_OP_HELLO }, { RSUSB_KEY_VERSION, pv } } ) );
+            int rv = probe_result( r, pv, line );
+            xpc_release( r );
+            return rv;
+        };
+        std::string line;
+        env e( { "d455.plist" } );
+        CHECK_EQ( probe( e, RSUSB_PROTOCOL_VERSION, line ), 0 );
+        CHECK( line == "ok " + std::to_string( RSUSBD_SERVICE_VERSION ) );
+        CHECK_EQ( probe( e, 99, line ), 5 );
+        CHECK( line == "protocol version " + std::to_string( RSUSB_PROTOCOL_VERSION ) );
+        e.pol->set_next_peer( 502, true );
+        CHECK_EQ( probe( e, RSUSB_PROTOCOL_VERSION, line ), 3 );
+        CHECK( line == "not the console user" );
+        e.pol->set_camera_allowed( false );
+        CHECK_EQ( probe( e, RSUSB_PROTOCOL_VERSION, line ), 4 );
+        CHECK( line == "camera disabled by policy" );
+        e.pol->set_camera_allowed( true );
+        std::vector< std::unique_ptr< client > > cs;
+        for( unsigned i = 0; i < RSUSB_MAX_CLIENTS; ++i )
+            cs.emplace_back( new client( e ) );
+        CHECK_EQ( probe( e, RSUSB_PROTOCOL_VERSION, line ), 6 );
+        CHECK( line == "too many clients" );
+        // a later service version is reported as it is
+        config c = test_config();
+        c.service_version = 31;
+        env later( { "d455.plist" }, fast(), c );
+        CHECK_EQ( probe( later, RSUSB_PROTOCOL_VERSION, line ), 0 );
+        CHECK( line == "ok 31" );
+        // a daemon of the first generation: no sv in the reply, build was "<build number> <build id>"
+        xpc_object_t gen1 = dict( { { RSUSB_KEY_VERSION, 1 }, { RSUSB_KEY_AUTH, RSUSB_AUTH_OK } } );
+        xpc_dictionary_set_int64( gen1, RSUSB_KEY_STATUS, 0 );
+        xpc_dictionary_set_string( gen1, RSUSB_KEY_BUILD, "202611041200 aaaaaaaaaaaa" );
+        CHECK_EQ( probe_result( gen1, 1, line ), 0 );
+        CHECK( line == "ok 1" );
+        // admitted, but in a protocol version the asking program does not speak
+        CHECK_EQ( probe_result( gen1, 2, line ), 5 );
+        CHECK( line == "protocol version 1" );
+        // nothing answered (not installed, switched off, or the administrator's list does not have this program)
+        const char * unreachable = "unreachable: the camera service is not installed, switched off, or does not admit this program";
+        CHECK_EQ( probe_result( (xpc_object_t)XPC_ERROR_CONNECTION_INVALID, 1, line ), 2 );
+        CHECK( line == unreachable );
+        line.clear();
+        CHECK_EQ( probe_result( (xpc_object_t)XPC_ERROR_CONNECTION_INTERRUPTED, 1, line ), 2 );
+        CHECK( line == unreachable );
+        // What the binary does with each HELLO it sends (probe_attempt). An interrupted connection is tried again;
+        // interrupted every time (the list does not have this program, or the daemon cannot start), or when the
+        // probe's time is up, it prints the same line as for every connection that gave no reply.
+        xpc_object_t interrupted = (xpc_object_t)XPC_ERROR_CONNECTION_INTERRUPTED;
+        for( int attempt = 0; attempt + 1 < PROBE_ATTEMPTS; ++attempt )
+            CHECK_EQ( probe_attempt( interrupted, 1, attempt, true, line ), PROBE_AGAIN );
+        line.clear();
+        CHECK_EQ( probe_attempt( interrupted, 1, PROBE_ATTEMPTS - 1, true, line ), 2 );
+        CHECK( line == unreachable );
+        line.clear();
+        CHECK_EQ( probe_attempt( interrupted, 1, 0, false, line ), 2 );
+        CHECK( line == unreachable );
+        // every other outcome ends the probe at the first attempt
+        line.clear();
+        CHECK_EQ( probe_attempt( (xpc_object_t)XPC_ERROR_CONNECTION_INVALID, 1, 0, true, line ), 2 );
+        CHECK( line == unreachable );
+        CHECK_EQ( probe_attempt( gen1, 1, 0, true, line ), 0 );
+        CHECK( line == "ok 1" );
+        CHECK_EQ( probe_attempt( gen1, 2, 0, true, line ), 5 );
+        CHECK( line == "protocol version 1" );
+        CHECK_EQ( probe_attempt( nullptr, 1, 0, true, line ), 2 );   // no reply before the deadline
+        CHECK( line == "unreachable: no answer" );
+        // not a HELLO reply
+        xpc_object_t bad = dict( { { RSUSB_KEY_VERSION, 1 } } );
+        xpc_dictionary_set_int64( bad, RSUSB_KEY_STATUS, 0 );
+        CHECK_EQ( probe_result( bad, 1, line ), 2 );
+        CHECK( line == "rejected: invalid reply" );
+        xpc_dictionary_set_uint64( bad, RSUSB_KEY_AUTH, 77 );
+        CHECK_EQ( probe_result( bad, 1, line ), 2 );
+        CHECK( line == "rejected: auth 77" );
+    }
+
+    CASE( policy_macos_admission )
+    {
+        // The real policy behind the core (console uid = the tester, as in H6); the peer is this test binary.
+        auto real = []( const std::vector< std::string > & cdhashes, const std::string & daemon_cdhash = "",
+                        bool lightweight = false ) {
+            macos_policy_options o;
+            o.cdhashes = cdhashes;
+            o.daemon_cdhash = daemon_cdhash;
+            o.lightweight = lightweight;
+            o.force_console_uid = getuid();
+            o.queue = dispatch_queue_create( "test.policy", DISPATCH_QUEUE_SERIAL );
+            return new macos_policy( o );
+        };
+        {
+            // No AllowedCDHashes (the default): no code-signing requirement, so a program the daemon knows nothing
+            // about gets its HELLO answered by the user and camera checks. Which of the three answers depends on
+            // where the test runs (a login session at the screen, ssh, a Mac with the camera disabled).
+            env e( load( { "d455.plist" } ), fast(), test_config(), nullptr, real( {} ) );
+            client a( e, false );
+            auto h = a.hello_full();
+            CHECK( h.auth == RSUSB_AUTH_OK || h.auth == RSUSB_AUTH_USER || h.auth == RSUSB_AUTH_CAMERA_DISABLED );
+            CHECK_EQ( h.sv, RSUSBD_SERVICE_VERSION );
+            CHECK_EQ( e.core->stats().ready, h.auth == RSUSB_AUTH_OK ? 1 : 0 );
+            printf( "no AllowedCDHashes: HELLO answered, auth %llu\n", (unsigned long long)h.auth );
+        }
+        {
+            // The administrator's list without this binary: as before, its messages are dropped (no reply at all)
+            // and the NEW timeout removes the connection
+            env e( load( { "d455.plist" } ), fast(), test_config(), nullptr, real( { std::string( 40, '7' ) } ) );
+            client a( e, false );
+            auto p = a.send( dict( { { RSUSB_KEY_OP, RSUSB_OP_HELLO }, { RSUSB_KEY_VERSION, RSUSB_PROTOCOL_VERSION } } ) );
+            CHECK( p->wait( 3000 ) );
+            CHECK( xpc_get_type( p->reply ) == XPC_TYPE_ERROR );
+            // what such a program's --probe prints for it, at the latest at its last attempt
+            std::string line;
+            CHECK_EQ( probe_attempt( p->reply, RSUSB_PROTOCOL_VERSION, PROBE_ATTEMPTS - 1, true, line ), 2 );
+            CHECK( line == "unreachable: the camera service is not installed, switched off, or does not admit this program" );
+            CHECK( wait_for( [&] { return e.core->stats().connections == 0; } ) );
+            CHECK_EQ( e.core->stats().ready, 0 );
+        }
+        for( bool lightweight : { false, true } )
+        {
+            // The same list in a daemon that adds its own cdhash, as realsense-usbd does. Here the peer is the very
+            // binary the "daemon" runs, like the installed binary's --probe: answered whatever the administrator
+            // listed.
+            env e( load( { "d455.plist" } ), fast(), test_config(), nullptr,
+                   real( { std::string( 40, '7' ) }, running_cdhash(), lightweight ) );
+            client a( e, false );
+            auto h = a.hello_full();
+            CHECK( h.auth == RSUSB_AUTH_OK || h.auth == RSUSB_AUTH_USER || h.auth == RSUSB_AUTH_CAMERA_DISABLED );
+        }
+    }
+
+    CASE( daemon_cdhash_in_requirement )
+    {
+        // realsense-usbd adds the cdhash of its own running code to a non-empty AllowedCDHashes (policy-macos)
+        std::string own = running_cdhash();   // this test binary; the linker signed it ad hoc
+        CHECK_EQ( own.size(), 40 );
+        CHECK( own.find_first_not_of( "0123456789abcdef" ) == std::string::npos );
+        std::string a( 40, 'a' ), b( 40, 'b' );
+        auto count = []( const std::string & text, const std::string & what ) {
+            size_t n = 0;
+            for( size_t at = text.find( what ); at != std::string::npos; at = text.find( what, at + 1 ) )
+                ++n;
+            return n;
+        };
+        auto lightweight_entries = []( const std::vector< std::string > & hashes, const std::string & which, size_t & total ) {
+            xpc_object_t req = cdhash_lightweight_requirement( hashes );
+            xpc_object_t in = get_typed( req, "cdhash", XPC_TYPE_DICTIONARY );
+            xpc_object_t list = in ? get_typed( in, "$in", XPC_TYPE_ARRAY ) : nullptr;
+            CHECK( list );
+            total = xpc_array_get_count( list );
+            size_t n = 0;
+            for( size_t i = 0; i < total; ++i )
+            {
+                size_t len = 0;
+                auto p = static_cast< const uint8_t * >( xpc_array_get_data( list, i, &len ) );
+                CHECK( p && len == 20 );
+                std::string hex;
+                for( size_t k = 0; k < len; ++k )
+                {
+                    char byte[3];
+                    snprintf( byte, sizeof( byte ), "%02x", p[k] );
+                    hex += byte;
+                }
+                n += hex == which;
+            }
+            xpc_release( req );
+            return n;
+        };
+        size_t total = 0;
+        // no administrator list: no requirement at all, the daemon's entry does not create one
+        CHECK( required_cdhashes( {}, own ).empty() );
+        // a list without the daemon: its entry follows the administrator's, once
+        auto r = required_cdhashes( { a, b }, own );
+        CHECK( r.size() == 3 && r[0] == a && r[1] == b && r[2] == own );
+        CHECK( cdhash_requirement( r ) == "cdhash H\"" + a + "\" or cdhash H\"" + b + "\" or cdhash H\"" + own + "\"" );
+        CHECK_EQ( count( cdhash_requirement( r ), own ), 1 );
+        CHECK_EQ( lightweight_entries( r, own, total ), 1 );
+        CHECK_EQ( total, 3 );
+        // the administrator already listed it: no duplicate, the order stays
+        r = required_cdhashes( { own, a }, own );
+        CHECK( r.size() == 2 && r[0] == own && r[1] == a );
+        CHECK_EQ( count( cdhash_requirement( r ), own ), 1 );
+        CHECK_EQ( lightweight_entries( r, own, total ), 1 );
+        CHECK_EQ( total, 2 );
+        // the administrator's limit stays 256; the daemon's entry is on top
+        std::vector< std::string > full;
+        for( int i = 0; i < 256; ++i )
+        {
+            char h[41];
+            snprintf( h, sizeof( h ), "%040x", i + 1 );
+            full.push_back( h );
+        }
+        r = required_cdhashes( full, own );
+        CHECK_EQ( r.size(), 257 );
+        CHECK( std::equal( full.begin(), full.end(), r.begin() ) && r.back() == own );
+        CHECK_EQ( count( cdhash_requirement( r ), "cdhash H\"" ), 257 );
+        CHECK_EQ( lightweight_entries( r, own, total ), 1 );
+        CHECK_EQ( total, 257 );
+        // a cdhash that could not be read (empty) or is malformed adds nothing: the administrator's list alone
+        CHECK( required_cdhashes( { a, b }, "" ) == std::vector< std::string >( { a, b } ) );
+        CHECK( required_cdhashes( { a, b }, std::string( 39, 'c' ) ) == std::vector< std::string >( { a, b } ) );
+        CHECK( required_cdhashes( { a, b }, std::string( 40, 'C' ) ) == std::vector< std::string >( { a, b } ) );
+        CHECK( required_cdhashes( { a, b }, std::string( 39, 'c' ) + "\"" ) == std::vector< std::string >( { a, b } ) );
     }
 
     CASE( enumerate_fixtures )
@@ -1423,26 +1711,71 @@ namespace
         auto plist = []( const std::string & body ) {
             return "<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict>" + body + "</dict></plist>";
         };
-        std::string h1( 40, 'a' ), h2( 40, 'b' );
-        std::string base = "<key>Version</key><integer>1</integer><key>BuildID</key><string>" + std::string( 64, 'f' )
-            + "</string><key>BuildNumber</key><integer>202611041200</integer><key>ProtocolVersion</key><integer>1</integer>"
-              "<key>AllowedCDHashes</key><array><string>" + h1 + "</string><string>" + h2 + "</string></array>";
-        std::string daemon = "<key>DaemonCDHash</key><string>" + h1 + "</string>";
+        auto allowed = []( const std::vector< std::string > & hashes ) {
+            std::string a = "<key>AllowedCDHashes</key><array>";
+            for( auto & h : hashes )
+                a += "<string>" + h + "</string>";
+            return a + "</array>";
+        };
         auto parse = [&]( const std::string & s, config & c ) {
             std::string err;
             return parse_config( reinterpret_cast< const uint8_t * >( s.data() ), s.size(), c, err );
         };
+        std::string h1( 40, 'a' ), h2( 40, 'b' );
+        std::string version = "<key>Version</key><integer>2</integer>";
+        // what the installer writes: Version and the manifest values, which the daemon does not read
+        std::string base = version + "<key>ServiceVersion</key><integer>9</integer><key>ProtocolMin</key><integer>5</integer>"
+                                     "<key>ProtocolMax</key><integer>6</integer><key>DaemonCDHash</key><string>" + h1 + "</string>";
         config c;
-        CHECK( parse( plist( base + daemon ), c ) );
-        CHECK_EQ( c.cdhashes.size(), 2 );
+        // no AllowedCDHashes: valid, and no program restriction
+        CHECK( parse( plist( base ), c ) );
+        CHECK( c.cdhashes.empty() );
         CHECK_EQ( c.grace_s, 5 );
         CHECK_EQ( c.idle_exit_s, 60 );
-        CHECK( parse( plist( base + daemon + "<key>HandBackGraceSeconds</key><integer>0</integer><key>IdleExitSeconds</key><integer>3600</integer>"
-                                                "<key>DeniedHWMOpcodes</key><array><integer>149</integer><integer>168</integer></array>"
-                                                "<key>ProtectedFlashRanges</key><array><dict><key>Start</key><integer>0</integer><key>Length</key><integer>4294967296</integer></dict></array>"
-                                                "<key>Unknown</key><string>ignored</string>" ),
+        CHECK( c.denied_opcodes.none() && c.protected_ranges.empty() );
+        // the versions the daemon answers with are its own, never the file's
+        CHECK_EQ( c.service_version, RSUSBD_SERVICE_VERSION );
+        CHECK_EQ( c.protocol_min, RSUSB_PROTOCOL_MIN_VERSION );
+        CHECK_EQ( c.protocol_max, RSUSB_PROTOCOL_VERSION );
+        CHECK( parse( plist( version ), c ) && c.cdhashes.empty() );   // Version alone is enough
+        CHECK( parse( plist( base + allowed( {} ) ), c ) && c.cdhashes.empty() );   // an empty list is no restriction
+        // the manifest values are not even type-checked
+        CHECK( parse( plist( version + "<key>ServiceVersion</key><string>x</string><key>ProtocolMin</key><real>1.5</real>"
+                                       "<key>DaemonCDHash</key><integer>1</integer>" ), c ) );
+        // the administrator's list; DaemonCDHash need not be on it
+        CHECK( parse( plist( base + allowed( { h2 } ) ), c ) );
+        CHECK( c.cdhashes.size() == 1 && c.cdhashes[0] == h2 );
+        CHECK( parse( plist( base + allowed( { h1, h2 } ) ), c ) );
+        CHECK( c.cdhashes.size() == 2 && c.cdhashes[0] == h1 && c.cdhashes[1] == h2 );
+        CHECK( parse( plist( base + allowed( std::vector< std::string >( 256, h1 ) ) ), c ) );
+        CHECK_EQ( c.cdhashes.size(), 256 );
+        CHECK( parse( plist( base + allowed( { h1, h2 } ) ), c ) );
+        // every entry must be 40 lowercase hex; a failed parse leaves the caller's config alone
+        const std::vector< std::string > bad_lists = {
+            allowed( { h1, std::string( 40, 'B' ) } ),                  // upper case
+            allowed( { std::string( 39, 'a' ) } ),                      // too short
+            allowed( { std::string( 41, 'a' ) } ),                      // too long
+            allowed( { std::string( 39, 'a' ) + "g" } ),                // not hex
+            allowed( { "" } ),
+            allowed( { h1 + " " } ),
+            "<key>AllowedCDHashes</key><array><string>" + h1 + "</string><integer>1</integer></array>",
+            "<key>AllowedCDHashes</key><array><array><string>" + h1 + "</string></array></array>",
+            "<key>AllowedCDHashes</key><string>" + h1 + "</string>",   // not an array
+            "<key>AllowedCDHashes</key><dict/>",
+            "<key>AllowedCDHashes</key><false/>",
+            allowed( std::vector< std::string >( 257, h1 ) ),           // more than 256 entries
+        };
+        for( auto & b : bad_lists )
+            CHECK( ! parse( plist( base + b ), c ) );
+        CHECK( c.cdhashes.size() == 2 && c.cdhashes[0] == h1 );
+        // the administrator's other keys
+        CHECK( parse( plist( base + "<key>HandBackGraceSeconds</key><integer>0</integer><key>IdleExitSeconds</key><integer>3600</integer>"
+                                    "<key>DeniedHWMOpcodes</key><array><integer>149</integer><integer>168</integer></array>"
+                                    "<key>ProtectedFlashRanges</key><array><dict><key>Start</key><integer>0</integer><key>Length</key><integer>4294967296</integer></dict></array>"
+                                    "<key>Unknown</key><string>ignored</string>" ),
                       c ) );
         CHECK( c.denied_opcodes.test( 0x95 ) && c.denied_opcodes.test( 0xA8 ) && c.protected_ranges.size() == 1 && c.grace_s == 0 );
+        CHECK( c.idle_exit_s == 3600 && c.cdhashes.empty() );
         const char * bad[] = {
             "<key>HandBackGraceSeconds</key><integer>601</integer>", "<key>IdleExitSeconds</key><integer>9</integer>",
             "<key>DeniedHWMOpcodes</key><array><integer>256</integer></array>", "<key>DeniedHWMOpcodes</key><integer>1</integer>",
@@ -1451,28 +1784,31 @@ namespace
             "<key>HandBackGraceSeconds</key><real>5</real>", "<key>HandBackGraceSeconds</key><string>5</string>",
         };
         for( auto b : bad )
-            CHECK( ! parse( plist( base + daemon + b ), c ) );
-        CHECK( ! parse( plist( base ), c ) );   // no DaemonCDHash
-        CHECK( ! parse( plist( base + "<key>DaemonCDHash</key><string>" + std::string( 40, 'c' ) + "</string>" ), c ) );
-        std::string upper = base;
-        upper.replace( upper.find( h2 ), 40, std::string( 40, 'B' ) );
-        CHECK( ! parse( plist( upper + daemon ), c ) );
-        std::string v2 = base;
-        v2.replace( v2.find( "<integer>1</integer>" ), 20, "<integer>2</integer>" );
-        CHECK( ! parse( plist( v2 + daemon ), c ) );
+            CHECK( ! parse( plist( base + b ), c ) );
+        // Version must be the integer 2. A complete generation-1 file (Version 1, the allowlist of one build) is
+        // refused: its AllowedCDHashes was the build pin, not an administrator's choice.
+        std::string rest = base.substr( version.size() );
+        std::string gen1 = "<key>Version</key><integer>1</integer><key>BuildID</key><string>" + std::string( 64, 'f' )
+            + "</string><key>BuildNumber</key><integer>202611041200</integer><key>ProtocolVersion</key><integer>1</integer>"
+            + allowed( { h1, h2 } ) + "<key>DaemonCDHash</key><string>" + h1 + "</string>";
+        CHECK( ! parse( plist( gen1 ), c ) );
+        CHECK( ! parse( plist( rest ), c ) );                                              // no Version
+        CHECK( ! parse( plist( "<key>Version</key><integer>1</integer>" + rest ), c ) );
+        CHECK( ! parse( plist( "<key>Version</key><integer>3</integer>" + rest ), c ) );
+        CHECK( ! parse( plist( "<key>Version</key><integer>0</integer>" + rest ), c ) );
+        CHECK( ! parse( plist( "<key>Version</key><string>2</string>" + rest ), c ) );
+        CHECK( ! parse( plist( "<key>Version</key><real>2</real>" + rest ), c ) );
+        CHECK( ! parse( plist( "<key>Version</key><true/>" + rest ), c ) );
         CHECK( ! parse( "not a plist", c ) );
-        std::string many = "<key>Version</key><integer>1</integer><key>BuildID</key><string>" + std::string( 64, 'f' )
-            + "</string><key>BuildNumber</key><integer>1</integer><key>ProtocolVersion</key><integer>1</integer><key>AllowedCDHashes</key><array>";
-        for( int i = 0; i < 257; ++i )
-            many += "<string>" + h1 + "</string>";
-        CHECK( ! parse( plist( many + "</array>" + daemon ), c ) );
+        CHECK( ! parse( "<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><array/></plist>", c ) );
         // file rules (owner check off: the tester owns the temp dir)
         std::string dir = temp_dir();
         chmod( dir.c_str(), 0755 );
-        std::string file = dir + "/usbd.plist", text = plist( base + daemon ), err;
+        std::string file = dir + "/usbd.plist", text = plist( base + allowed( { h1 } ) ), err;
         std::ofstream( file ) << text;
         chmod( file.c_str(), 0644 );
         CHECK( load_config( file, false, c, err ) );
+        CHECK( c.cdhashes.size() == 1 && c.cdhashes[0] == h1 );
         CHECK( ! load_config( file, true, c, err ) );   // not root-owned
         chmod( file.c_str(), 0664 );
         CHECK( ! load_config( file, false, c, err ) );
@@ -1485,283 +1821,9 @@ namespace
         std::ofstream( dir + "/big.plist" ) << std::string( 70000, ' ' );
         chmod( ( dir + "/big.plist" ).c_str(), 0644 );
         CHECK( ! load_config( dir + "/big.plist", false, c, err ) );
-    }
-
-    // usbd.d/<name>.plist (DESIGN 5.4) as XML; `hashes` = AllowedCDHashes, `extra` = more keys
-    std::string extra_plist( const std::string & name, const std::vector< std::string > & hashes, const std::string & extra = "",
-                             const std::string & build_number = "<integer>202611050000</integer>",
-                             const std::string & protocol = "<integer>1</integer>" )
-    {
-        std::string s = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>Version</key><integer>1</integer>"
-                        "<key>Name</key><string>" + name + "</string><key>BuildID</key><string>" + std::string( 64, 'e' )
-                      + "</string><key>BuildNumber</key>" + build_number + "<key>ProtocolVersion</key>" + protocol
-                      + "<key>AllowedCDHashes</key><array>";
-        for( auto & h : hashes )
-            s += "<string>" + h + "</string>";
-        return s + "</array>" + extra + "</dict></plist>";
-    }
-
-    std::string hash_n( unsigned n, char prefix = 'a' )   // distinct 40-hex hashes
-    {
-        char b[41];
-        snprintf( b, sizeof( b ), "%c%039x", prefix, n );
-        return b;
-    }
-
-    std::vector< std::string > hashes_n( unsigned count, char prefix, unsigned first = 0 )
-    {
-        std::vector< std::string > rv;
-        for( unsigned i = 0; i < count; ++i )
-            rv.push_back( hash_n( first + i, prefix ) );
-        return rv;
-    }
-
-    void write_file( const std::string & path, const std::string & text, mode_t mode = 0644 )
-    {
-        std::ofstream( path ) << text;
-        CHECK( chmod( path.c_str(), mode ) == 0 );
-    }
-
-    CASE( extra_list_parser )
-    {
-        auto parse = []( const std::string & s, const std::string & name, extra_list & l ) {
-            std::string err;
-            return parse_extra_list( reinterpret_cast< const uint8_t * >( s.data() ), s.size(), name, l, err );
-        };
-        const std::string n = "io.github.example.app";
-        std::vector< std::string > two = { hash_n( 1 ), hash_n( 2 ) };
-        extra_list l;
-        CHECK( parse( extra_plist( n, two ), n, l ) );
-        CHECK( l.name == n && l.build_number == 202611050000 && l.protocol == 1 && l.cdhashes == two );
-        // unknown keys and the administrator keys of usbd.plist are ignored (they are unknown keys here)
-        CHECK( parse( extra_plist( n, two, "<key>Unknown</key><string>x</string><key>HandBackGraceSeconds</key><integer>0</integer>"
-                                           "<key>DaemonCDHash</key><string>" + two[0] + "</string>" ), n, l ) );
-        // a list made for another protocol version parses (kept; the daemon flags it and its programs get AUTH_VERSION)
-        CHECK( parse( extra_plist( n, two, "", "<integer>1</integer>", "<integer>2</integer>" ), n, l ) && l.protocol == 2 );
-        CHECK( parse( extra_plist( n, two, "", "<integer>999999999999999999</integer>" ), n, l ) );
-        CHECK( parse( extra_plist( n, hashes_n( 64, 'b' ) ), n, l ) && l.cdhashes.size() == 64 );
-        std::string v2 = extra_plist( n, two );
-        v2.replace( v2.find( "<integer>1</integer>" ), 20, "<integer>2</integer>" );
-        CHECK( ! parse( v2, n, l ) );
-        CHECK( ! parse( extra_plist( n, two ), "io.github.other.app", l ) );   // Name mismatch
-        CHECK( ! parse( extra_plist( "Io.github.example.app", two ), "Io.github.example.app", l ) );   // not a list name
-        std::string bad_id = extra_plist( n, two );
-        bad_id.replace( bad_id.find( std::string( 64, 'e' ) ), 64, std::string( 63, 'e' ) );
-        CHECK( ! parse( bad_id, n, l ) );
-        std::string upper_id = extra_plist( n, two );
-        upper_id.replace( upper_id.find( std::string( 64, 'e' ) ), 64, std::string( 64, 'E' ) );
-        CHECK( ! parse( upper_id, n, l ) );
-        for( const char * bn : { "<integer>-1</integer>", "<real>5</real>", "<string>5</string>", "<integer>1000000000000000000</integer>" } )
-            CHECK( ! parse( extra_plist( n, two, "", bn ), n, l ) );
-        for( const char * pv : { "<integer>0</integer>", "<string>1</string>", "<integer>2147483648</integer>", "<true/>" } )
-            CHECK( ! parse( extra_plist( n, two, "", "<integer>1</integer>", pv ), n, l ) );
-        CHECK( ! parse( extra_plist( n, {} ), n, l ) );
-        CHECK( ! parse( extra_plist( n, hashes_n( 65, 'b' ) ), n, l ) );
-        CHECK( ! parse( extra_plist( n, { hash_n( 1 ), std::string( 40, 'A' ) } ), n, l ) );
-        CHECK( ! parse( extra_plist( n, { hash_n( 1 ), hash_n( 1 ) } ), n, l ) );   // duplicate
-        CHECK( ! parse( extra_plist( n, { hash_n( 1 ).substr( 0, 39 ) } ), n, l ) );
-        std::string not_string = extra_plist( n, two );
-        std::string second = "<string>" + two[1] + "</string>";
-        not_string.replace( not_string.find( second ), second.size(), "<integer>1</integer>" );
-        CHECK( ! parse( not_string, n, l ) );
-        std::string no_hashes = extra_plist( n, two );
-        no_hashes.replace( no_hashes.find( "<key>AllowedCDHashes</key>" ), 26, "<key>Other</key>" );
-        CHECK( ! parse( no_hashes, n, l ) );
-        CHECK( ! parse( "<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><array><string>x</string></array></plist>", n, l ) );
-        CHECK( ! parse( "not a plist", n, l ) );
-        CHECK( ! parse( "", n, l ) );
-    }
-
-    CASE( extra_list_names )
-    {
-        for( std::string ok : { "a.b", "io.github.x.y-z", "io.github.dolegadolegowski.intelfacescan", "0.9", "a-1.b2" } )
-            CHECK( valid_list_name( ok ) );
-        std::string hundred = std::string( 48, 'a' ) + "." + std::string( 51, 'b' );
-        CHECK_EQ( hundred.size(), 100 );
-        CHECK( valid_list_name( hundred ) );
-        for( std::string bad : { "x", "ab", "A.b", "a..b", "-a.b", "a.b-", "a/b.c", ".a.b", "a.b.", "a.-b", "a_b.c", "a b.c",
-                                 "a.b/..", "a.b\n" } )
-            CHECK( ! valid_list_name( bad ) );
-        CHECK( ! valid_list_name( hundred + "b" ) );
-        CHECK( ! valid_list_name( std::string( "a.b\0c", 5 ) ) );
-    }
-
-    CASE( extra_list_files )
-    {
-        std::string base = temp_dir(), dir = base + "/usbd.d", err;
-        std::vector< std::string > problems;
-        // absent directory: nothing, no problem
-        CHECK( load_extra_lists( dir, false, problems ).empty() && problems.empty() );
-        CHECK( mkdir( dir.c_str(), 0755 ) == 0 );
-        CHECK( chmod( dir.c_str(), 0755 ) == 0 );
-        write_file( dir + "/a.good.plist", extra_plist( "a.good", { hash_n( 1 ) } ) );
-        write_file( dir + "/z.good.plist", extra_plist( "z.good", { hash_n( 2 ) } ) );
-        // a group-writable directory: no lists, one problem
-        CHECK( chmod( dir.c_str(), 0775 ) == 0 );
-        CHECK( load_extra_lists( dir, false, problems ).empty() );
-        CHECK_EQ( problems.size(), 1 );
-        CHECK( problems[0] == "usbd.d: unsafe directory" );
-        CHECK( chmod( dir.c_str(), 0755 ) == 0 );
-        // root-owned required: the tester's directory is refused
-        problems.clear();
-        CHECK( load_extra_lists( dir, true, problems ).empty() && problems.size() == 1 );
-        // a symlinked directory is refused
-        CHECK( symlink( dir.c_str(), ( base + "/link.d" ).c_str() ) == 0 );
-        problems.clear();
-        CHECK( load_extra_lists( base + "/link.d", false, problems ).empty() && problems.size() == 1 );
-        // every bad entry is skipped with its own problem, the good ones (before and after them) stay
-        std::string outside = base + "/outside.plist";
-        write_file( outside, extra_plist( "h.hardlink", { hash_n( 3 ) } ) );
-        CHECK( link( outside.c_str(), ( dir + "/h.hardlink.plist" ).c_str() ) == 0 );
-        write_file( base + "/target.plist", extra_plist( "s.symlink", { hash_n( 4 ) } ) );
-        CHECK( symlink( ( base + "/target.plist" ).c_str(), ( dir + "/s.symlink.plist" ).c_str() ) == 0 );
-        write_file( dir + "/w.writable.plist", extra_plist( "w.writable", { hash_n( 5 ) } ), 0666 );
-        CHECK( mkdir( ( dir + "/d.subdir.plist" ).c_str(), 0755 ) == 0 );
-        CHECK( mkfifo( ( dir + "/f.fifo.plist" ).c_str(), 0644 ) == 0 );
-        write_file( dir + "/b.big.plist", extra_plist( "b.big", { hash_n( 6 ) }, "<key>Pad</key><string>" + std::string( 70000, 'x' ) + "</string>" ) );
-        write_file( dir + "/Bad.Name.plist", extra_plist( "Bad.Name", { hash_n( 7 ) } ) );
-        write_file( dir + "/x.plist.tmp", extra_plist( "x", { hash_n( 8 ) } ) );
-        write_file( dir + "/n.mismatch.plist", extra_plist( "n.other", { hash_n( 9 ) } ) );
-        write_file( dir + "/i.invalid.plist", "not a plist" );
-        write_file( dir + "/.foo.plist.tmp.1", "temporary file of the list tool" );
-        problems.clear();
-        alarm( 2 );   // a FIFO must not block the loader
-        auto lists = load_extra_lists( dir, false, problems );
-        alarm( 0 );
-        CHECK_EQ( lists.size(), 2 );
-        CHECK( lists[0].name == "a.good" && lists[1].name == "z.good" );
-        for( auto & p : problems )
-            CHECK( p.compare( 0, 7, "usbd.d/" ) == 0 );
-        auto has = [&]( const std::string & file, const std::string & why ) {
-            for( auto & p : problems )
-                if( p.compare( 0, 7 + file.size() + 2, "usbd.d/" + file + ": " ) == 0 && p.find( why ) != std::string::npos )
-                    return true;
-            return false;
-        };
-        CHECK( has( "h.hardlink.plist", "hard-linked" ) );
-        CHECK( has( "s.symlink.plist", "symlink" ) );
-        CHECK( has( "w.writable.plist", "writable" ) );
-        CHECK( has( "d.subdir.plist", "not a regular file" ) );
-        CHECK( has( "f.fifo.plist", "not a regular file" ) );
-        CHECK( has( "b.big.plist", "64 KiB" ) );
-        CHECK( has( "Bad.Name.plist", "name" ) );
-        CHECK( has( "x.plist.tmp", "name" ) );
-        CHECK( has( "n.mismatch.plist", "Name" ) );
-        CHECK( has( "i.invalid.plist", "invalid" ) );
-        CHECK_EQ( problems.size(), 10 );   // the dot file is skipped silently
-        // 17 valid lists: the first 16 by name are loaded, the 17th gets a problem
-        std::string many = base + "/many.d";
-        CHECK( mkdir( many.c_str(), 0755 ) == 0 );
-        CHECK( chmod( many.c_str(), 0755 ) == 0 );
-        for( unsigned i = 17; i >= 1; --i )
-        {
-            char n[32];
-            snprintf( n, sizeof( n ), "l%02u.example", i );
-            write_file( many + "/" + n + ".plist", extra_plist( n, { hash_n( i, 'c' ) } ) );
-        }
-        problems.clear();
-        lists = load_extra_lists( many, false, problems );
-        CHECK_EQ( lists.size(), MAX_EXTRA_LISTS );
-        CHECK( lists.front().name == "l01.example" && lists.back().name == "l16.example" );
-        CHECK_EQ( problems.size(), 1 );
-        CHECK( problems[0] == "usbd.d/l17.example.plist: more than 16 lists" );
-        // usbd.plist next to a usbd.d full of problems loads as before
-        std::string conf_text = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>Version</key><integer>1</integer>"
-                                "<key>BuildID</key><string>" + std::string( 64, 'f' ) + "</string><key>BuildNumber</key><integer>7</integer>"
-                                "<key>ProtocolVersion</key><integer>1</integer><key>AllowedCDHashes</key><array><string>" + hash_n( 1 )
-                              + "</string></array><key>DaemonCDHash</key><string>" + hash_n( 1 ) + "</string></dict></plist>";
-        CHECK( chmod( base.c_str(), 0755 ) == 0 );
-        write_file( base + "/usbd.plist", conf_text );
-        config c;
-        CHECK( load_config( base + "/usbd.plist", false, c, err ) );
-        CHECK( c.build_number == 7 && c.cdhashes.size() == 1 && c.extra_lists.empty() && c.admitted_cdhashes.empty() );
-    }
-
-    CASE( allowlist_merge )
-    {
-        auto list = []( const std::string & name, std::vector< std::string > h ) {
-            extra_list l;
-            l.name = name;
-            l.protocol = 1;
-            l.cdhashes = std::move( h );
-            return l;
-        };
-        std::vector< std::string > problems;
-        // no extras: exactly the own list, so the requirement string (cdhash_requirement of it) is byte-identical
-        config c = test_config();
-        c.cdhashes = { hash_n( 3 ), hash_n( 1 ), hash_n( 2 ) };
-        apply_extra_lists( c, {}, problems );
-        CHECK( c.admitted_cdhashes == c.cdhashes && c.extra_lists.empty() && problems.empty() );
-        // a hash shared with the own list or an earlier list is admitted once
-        apply_extra_lists( c, { list( "b.two", { hash_n( 1 ), hash_n( 9 ) } ), list( "a.one", { hash_n( 9 ), hash_n( 8 ) } ) }, problems );
-        CHECK( problems.empty() && c.extra_lists.size() == 2 && c.extra_lists[0].name == "a.one" );
-        CHECK( ( c.admitted_cdhashes == std::vector< std::string >{ hash_n( 3 ), hash_n( 1 ), hash_n( 2 ), hash_n( 9 ), hash_n( 8 ) } ) );
-        // own 200 + list A 40 + list B 20: B is skipped whole, A kept, the own list first
-        c.cdhashes = hashes_n( 200, 'a' );
-        apply_extra_lists( c, { list( "b.list", hashes_n( 20, 'b' ) ), list( "a.list", hashes_n( 40, 'c' ) ) }, problems );
-        CHECK_EQ( c.admitted_cdhashes.size(), 240 );
-        CHECK( std::equal( c.cdhashes.begin(), c.cdhashes.end(), c.admitted_cdhashes.begin() ) );
-        CHECK( c.extra_lists.size() == 1 && c.extra_lists[0].name == "a.list" );
-        CHECK_EQ( problems.size(), 1 );
-        CHECK( problems[0] == "usbd.d/b.list.plist: more than 256 code hashes together with the lists before it" );
-        // name order decides which one is skipped
-        problems.clear();
-        apply_extra_lists( c, { list( "a.list", hashes_n( 20, 'b' ) ), list( "b.list", hashes_n( 40, 'c' ) ) }, problems );
-        CHECK( c.extra_lists.size() == 1 && c.extra_lists[0].name == "a.list" && c.admitted_cdhashes.size() == 220 );
-        CHECK( problems.size() == 1 && problems[0].find( "usbd.d/b.list.plist:" ) == 0 );
-        // exactly 256 are admitted; shared hashes do not count twice
-        problems.clear();
-        auto shared = hashes_n( 56, 'd' );
-        shared.push_back( c.cdhashes[0] );
-        apply_extra_lists( c, { list( "a.list", shared ) }, problems );
-        CHECK( problems.empty() && c.admitted_cdhashes.size() == MAX_ADMITTED_HASHES && c.extra_lists.size() == 1 );
-        apply_extra_lists( c, { list( "a.list", hashes_n( 57, 'd' ) ) }, problems );
-        CHECK( problems.size() == 1 && c.admitted_cdhashes == c.cdhashes && c.extra_lists.empty() );
-    }
-
-    CASE( allowlist_attribution )
-    {
-        auto list = []( const std::string & name, std::vector< std::string > h ) {
-            extra_list l;
-            l.name = name;
-            l.protocol = 1;
-            l.cdhashes = std::move( h );
-            return l;
-        };
-        std::vector< std::string > problems;
-        config own = test_config();
-        apply_extra_lists( own, {}, problems );
-        CHECK( lists_admitting( own, own.cdhashes[0] ) == "usbd.plist" );
-        CHECK( lists_admitting( own, hash_n( 1 ) ).empty() );
-        config c = test_config();
-        apply_extra_lists( c, { list( "io.github.example.app", { hash_n( 1 ), c.cdhashes[0] } ), list( "b.second", { hash_n( 1 ) } ),
-                                list( "z.toolarge", hashes_n( 256, 'b' ) ) },
-                           problems );
-        CHECK_EQ( problems.size(), 1 );   // z.toolarge is skipped by the cap and admits nothing
-        CHECK( lists_admitting( c, c.cdhashes[0] ) == "usbd.plist, io.github.example.app" );
-        CHECK( lists_admitting( c, hash_n( 1 ) ) == "b.second, io.github.example.app" );
-        CHECK( lists_admitting( c, hash_n( 0, 'b' ) ).empty() );
-        CHECK( lists_admitting( c, "" ).empty() );
-        // the core asks the policy for the peer's cdhash once per admitted HELLO, never for a rejected one
-        env e( { "d455.plist" }, fast(), c );
-        e.pol->set_next_peer_cdhash( hash_n( 1 ) );
-        {
-            client a( e );
-            CHECK( wait_for( [&] { return e.pol->peer_cdhash_calls() == 1; } ) );
-        }
-        e.pol->set_next_peer( 502, true );
-        client other_user( e, false );
-        CHECK_EQ( other_user.hello(), RSUSB_AUTH_USER );
-        client old_protocol( e, false );
-        CHECK_EQ( old_protocol.hello( 99 ), RSUSB_AUTH_VERSION );
-        e.pol->set_camera_allowed( false, false );
-        client cam( e, false );
-        CHECK_EQ( cam.hello(), RSUSB_AUTH_CAMERA_DISABLED );
-        e.pol->set_camera_allowed( true, false );
-        client b( e );   // an admitted peer whose cdhash the policy cannot tell (logged as "an unknown list")
-        CHECK( wait_for( [&] { return e.pol->peer_cdhash_calls() == 2; } ) );
-        sleep_ms( 100 );
-        CHECK_EQ( e.pol->peer_cdhash_calls(), 2 );
+        CHECK( ! load_config( dir + "/missing.plist", false, c, err ) );
+        // the installed path is the service's own folder, not an application's
+        CHECK( std::string( CONFIG_PATH ) == "/Library/Application Support/" RSUSB_SERVICE_NAME "/usbd.plist" );
     }
 
     CASE( state_file_and_sweep_selection )

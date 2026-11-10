@@ -1,16 +1,19 @@
 // License: Apache 2.0. See LICENSE file in root directory.
 // H6: the core with the mock backend behind the REAL peer policy (policy-macos), console uid = the tester.
 //
-//   rs-usbd-testd --agent <service> --config <usbd.plist> [--extra-dir <usbd.d>] [--fixtures <dir>] [--lightweight]
-//       per-user LaunchAgent mode (MachServices <service>); the config's AllowedCDHashes and the lists in the extra
-//       directory (DESIGN 5.5, owner checks off) admit clients
+//   rs-usbd-testd --agent <service> --config <usbd.plist> [--fixtures <dir>] [--lightweight]
+//       per-user LaunchAgent mode (MachServices <service>); a config without AllowedCDHashes admits every program,
+//       one with the list only the programs on it (this tool does not add its own cdhash as realsense-usbd does:
+//       its client is the same binary)
 //   rs-usbd-testd --client <service>
 //       client: HELLO over the Mach service, prints what it observes (reply or error, elapsed ms)
 //   rs-usbd-testd --inprocess [--fixtures <dir>]
 //       no launchd: anonymous listener + client in this process (the peer is this binary, so the requirement is
 //       built from this binary's own cdhash or from a foreign one) and records what client and daemon observe for:
-//       own cdhash, foreign cdhash, a 256-hash requirement, the lightweight-requirement fallback, the own cdhash only
-//       in a usbd.d list (and that list removed), and which list the real peer_cdhash attributes the peer to
+//       no list (the default: no requirement), own cdhash, foreign cdhash, a 256-hash requirement, the
+//       lightweight-requirement fallback, and a foreign list with the daemon's own entry on top (what realsense-usbd
+//       does so that its own --probe is always admitted; 256 + 1 hashes at most)
+// --fixtures defaults to the tests/fixtures folder next to the sources this binary was built from.
 
 #include "daemon/core/server.h"
 #include "daemon/core/xpc-util.h"
@@ -18,48 +21,21 @@
 #include "tests/backend-mock.h"
 #include "rs-usb-broker-protocol.h"
 
-#include <Security/Security.h>
-#include <sys/stat.h>
 #include <unistd.h>
 
 #include <atomic>
 #include <cstdio>
-#include <fstream>
-#include <mutex>
 #include <string>
 
 using namespace usbd;
 
+#ifndef RSUSBD_FIXTURES
+#define RSUSBD_FIXTURES "tests/fixtures"   // build-daemon.sh passes the absolute path
+#endif
+
 namespace
 {
-    std::string g_fixtures = "macos/broker/tests/fixtures";
-
-    std::string own_cdhash()
-    {
-        SecCodeRef code = nullptr;
-        SecStaticCodeRef st = nullptr;
-        CFDictionaryRef info = nullptr;
-        std::string rv;
-        if( SecCodeCopySelf( kSecCSDefaultFlags, &code ) == errSecSuccess
-            && SecCodeCopyStaticCode( code, kSecCSDefaultFlags, &st ) == errSecSuccess
-            && SecCodeCopySigningInformation( st, kSecCSDefaultFlags, &info ) == errSecSuccess )
-        {
-            auto h = static_cast< CFDataRef >( CFDictionaryGetValue( info, kSecCodeInfoUnique ) );
-            for( CFIndex i = 0; h && i < CFDataGetLength( h ); ++i )
-            {
-                char b[3];
-                snprintf( b, sizeof( b ), "%02x", CFDataGetBytePtr( h )[i] );
-                rv += b;
-            }
-        }
-        if( info )
-            CFRelease( info );
-        if( st )
-            CFRelease( st );
-        if( code )
-            CFRelease( code );
-        return rv;
-    }
+    std::string g_fixtures = RSUSBD_FIXTURES;
 
     // Wraps the real policy to record what the daemon side observes
     class recording_policy : public peer_policy
@@ -76,18 +52,6 @@ namespace
             last_auth = int( a );
             return a;
         }
-        std::string peer_cdhash( xpc_object_t message ) override
-        {
-            std::string h = _p->peer_cdhash( message );
-            std::lock_guard< std::mutex > lock( _m );
-            last_cdhash = h;
-            return h;
-        }
-        std::string recorded_cdhash()
-        {
-            std::lock_guard< std::mutex > lock( _m );
-            return last_cdhash;
-        }
         bool camera_allowed() override { return _p->camera_allowed(); }
         console_state console() override { return _p->console(); }
         void set_change_handler( std::function< void( change ) > h ) override { _p->set_change_handler( std::move( h ) ); }
@@ -97,8 +61,6 @@ namespace
 
     private:
         std::unique_ptr< macos_policy > _p;
-        std::mutex _m;
-        std::string last_cdhash;
     };
 
     std::vector< fixture_device > fixtures()
@@ -143,9 +105,10 @@ namespace
             rv = "XPC_ERROR_PEER_CODE_SIGNING_REQUIREMENT";
         else if( xpc_get_type( r ) == XPC_TYPE_DICTIONARY )
         {
-            uint64_t auth = 99;
+            uint64_t auth = 99, sv = 0;
             get_u64( r, RSUSB_KEY_AUTH, auth );
-            rv = "reply auth=" + std::to_string( auth );
+            get_u64( r, RSUSB_KEY_SERVICE_VERSION, sv );
+            rv = "reply auth=" + std::to_string( auth ) + " sv=" + std::to_string( sv );
         }
         else
             rv = "other";
@@ -158,72 +121,54 @@ namespace
         const char * name;
         std::vector< std::string > hashes;
         bool lightweight;
-        std::string extra_dir;   // usbd.d to merge (5.5), or none
+        bool daemon_entry = false;   // the daemon's own cdhash on top of the list (macos_policy_options::daemon_cdhash)
     };
-
-    // a usbd.d directory holding one list `name` with `hashes`, or none if `hashes` is empty
-    std::string make_extra_dir( const std::string & name, const std::vector< std::string > & hashes )
-    {
-        char tmpl[] = "/private/tmp/rs-usbd-testd.XXXXXX";
-        std::string dir = std::string( mkdtemp( tmpl ) ) + "/usbd.d";
-        mkdir( dir.c_str(), 0755 );
-        chmod( dir.c_str(), 0755 );
-        if( hashes.empty() )
-            return dir;
-        std::string s = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>Version</key><integer>1</integer>"
-                        "<key>Name</key><string>" + name + "</string><key>BuildID</key><string>" + std::string( 64, 'e' )
-                      + "</string><key>BuildNumber</key><integer>1</integer><key>ProtocolVersion</key><integer>1</integer>"
-                        "<key>AllowedCDHashes</key><array>";
-        for( auto & h : hashes )
-            s += "<string>" + h + "</string>";
-        std::ofstream( dir + "/" + name + ".plist" ) << s << "</array></dict></plist>";
-        chmod( ( dir + "/" + name + ".plist" ).c_str(), 0644 );
-        return dir;
-    }
 
     int inprocess()
     {
-        std::string self = own_cdhash();
+        std::string self = running_cdhash();   // the function realsense-usbd reads its own cdhash with
         printf( "own cdhash: %s\n", self.empty() ? "(unsigned)" : self.c_str() );
         if( self.size() != 40 )
             return 1;
         std::string foreign( 40, '7' );
-        std::vector< std::string > big;
-        for( int i = 0; i < 255; ++i )
+        std::vector< std::string > big, foreign256;
+        for( int i = 0; i < 256; ++i )
         {
             char b[41];
             snprintf( b, sizeof( b ), "%040x", i + 1 );
-            big.push_back( b );
+            foreign256.push_back( b );
         }
+        big.assign( foreign256.begin(), foreign256.end() - 1 );
         big.push_back( self );
-        printf( "256-hash requirement string: %zu bytes\n", cdhash_requirement( big ).size() );
-        const std::string list_name = "io.github.example.testd";
-        std::string with_list = make_extra_dir( list_name, { self } ), list_removed = make_extra_dir( list_name, {} );
-        experiment ex[] = { { "own cdhash", { self }, false, "" },
-                            { "foreign cdhash", { foreign }, false, "" },
-                            { "256 hashes incl. own", big, false, "" },
-                            { "256 hashes, own missing", std::vector< std::string >( big.begin(), big.end() - 1 ), false, "" },
-                            { "lightweight, own", { self }, true, "" },
-                            { "lightweight, foreign", { foreign }, true, "" },
-                            { "lightweight, 256 incl. own", big, true, "" },
-                            { "own cdhash only in usbd.d", { foreign }, false, with_list },
-                            { "usbd.d list removed", { foreign }, false, list_removed } };
+        printf( "256-hash requirement string: %zu bytes; with the daemon's own entry on top of 256: %zu bytes\n",
+                cdhash_requirement( big ).size(), cdhash_requirement( required_cdhashes( foreign256, self ) ).size() );
+        experiment ex[] = { { "no list", {}, false },
+                            { "no list, lightweight", {}, true },
+                            { "own cdhash", { self }, false },
+                            { "foreign cdhash", { foreign }, false },
+                            { "256 hashes incl. own", big, false },
+                            { "256 hashes, own missing", std::vector< std::string >( big.begin(), big.end() - 1 ), false },
+                            { "lightweight, own", { self }, true },
+                            { "lightweight, foreign", { foreign }, true },
+                            { "lightweight, 256 incl. own", big, true },
+                            { "foreign cdhash + the daemon's own entry", { foreign }, false, true },
+                            { "own cdhash listed + the daemon's own entry", { self }, false, true },
+                            { "256 foreign + the daemon's own entry", foreign256, false, true },
+                            { "lightweight, foreign + the daemon's own entry", { foreign }, true, true },
+                            { "lightweight, 256 foreign + the daemon's own entry", foreign256, true, true } };
         int failures = 0;
         for( auto & e : ex )
         {
-            config c;
-            c.build_id = std::string( 64, 'a' );
-            c.cdhashes = e.hashes;
-            std::vector< std::string > problems;
-            apply_extra_lists( c, e.extra_dir.empty() ? std::vector< extra_list >() : load_extra_lists( e.extra_dir, false, problems ), problems );
-            for( auto & p : problems )
-                printf( "    allowlist %s skipped\n", p.c_str() );
             macos_policy_options o;
-            o.cdhashes = c.admitted_cdhashes;
+            o.cdhashes = e.hashes;
+            if( e.daemon_entry )
+                o.daemon_cdhash = self;
             o.lightweight = e.lightweight;
             o.force_console_uid = getuid();
             o.queue = dispatch_queue_create( "testd.policy", DISPATCH_QUEUE_SERIAL );
             auto rec = new recording_policy( std::make_unique< macos_policy >( o ) );
+            config c;
+            c.cdhashes = e.hashes;
             usbd_core core( std::make_unique< mock_backend >( fixtures() ), std::unique_ptr< peer_policy >( rec ), c, timing(), temp_paths() );
             core.start( false );
             xpc_connection_t listener = xpc_connection_create( nullptr, dispatch_queue_create( "testd.listener", DISPATCH_QUEUE_SERIAL ) );
@@ -232,24 +177,17 @@ namespace
             xpc_connection_t c1 = xpc_connection_create_from_endpoint( ep );
             uint64_t ms;
             std::string seen = client_hello( c1, ms );
-            bool own = false;
-            for( auto & h : c.admitted_cdhashes )
-                own |= h == self;
+            // no list: no requirement, every program gets its HELLO answered; with the daemon's own entry this
+            // binary (the peer) is admitted whatever the list holds
+            bool admitted = e.hashes.empty() || e.daemon_entry;
+            for( auto & h : e.hashes )
+                admitted |= h == self;
             printf( "[%s] requirement set: %s; client: %s after %llu ms; daemon: HELLO handled %d time(s)%s\n", e.name,
-                    rec->prepared ? "yes" : "NO", seen.c_str(), (unsigned long long)ms, rec->hellos.load(),
+                    ! rec->prepared ? "NO" : e.hashes.empty() ? "none needed" : "yes", seen.c_str(), (unsigned long long)ms,
+                    rec->hellos.load(),
                     rec->hellos ? ( " (auth " + std::to_string( rec->last_auth.load() ) + ")" ).c_str() : " (message dropped)" );
-            bool ok = own ? seen.rfind( "reply", 0 ) == 0 : ( seen == "XPC_ERROR_CONNECTION_INTERRUPTED" && rec->hellos == 0 );
-            if( own )
-            {
-                // the admitted line is logged after the reply: wait for the policy's peer_cdhash call
-                for( int i = 0; i < 100 && rec->recorded_cdhash().empty(); ++i )
-                    usleep( 10000 );
-                std::string h = rec->recorded_cdhash(), by = lists_admitting( c, h );
-                printf( "    daemon: peer cdhash from the HELLO message %s, admitted by %s\n", h.empty() ? "(none)" : h.c_str(),
-                        by.empty() ? "an unknown list" : by.c_str() );
-                ok = ok && h == self && by == ( e.extra_dir.empty() ? "usbd.plist" : list_name );
-            }
-            if( ! own )
+            bool ok = admitted ? seen.rfind( "reply", 0 ) == 0 : ( seen == "XPC_ERROR_CONNECTION_INTERRUPTED" && rec->hellos == 0 );
+            if( ! admitted )
             {
                 // does the daemon get an error for the rejected peer, or does the NEW timeout remove it?
                 usleep( 100000 );
@@ -271,18 +209,14 @@ namespace
         _exit( failures ? 1 : 0 );
     }
 
-    int agent( const std::string & service, const std::string & cfg_path, const std::string & extra_dir, bool lightweight )
+    int agent( const std::string & service, const std::string & cfg_path, bool lightweight )
     {
         config c;
         std::string err;
         if( ! load_config( cfg_path, false, c, err ) )
             return fprintf( stderr, "config: %s\n", err.c_str() ), 1;
-        std::vector< std::string > problems;
-        apply_extra_lists( c, extra_dir.empty() ? std::vector< extra_list >() : load_extra_lists( extra_dir, false, problems ), problems );
-        for( auto & p : problems )
-            fprintf( stderr, "allowlist %s skipped\n", p.c_str() );
         macos_policy_options o;
-        o.cdhashes = c.admitted_cdhashes;
+        o.cdhashes = c.cdhashes;
         o.lightweight = lightweight;
         o.force_console_uid = getuid();
         o.queue = dispatch_get_main_queue();
@@ -305,7 +239,7 @@ namespace
 int main( int argc, char ** argv )
 {
     setvbuf( stdout, nullptr, _IOLBF, 0 );
-    std::string mode, service, cfg, extra_dir;
+    std::string mode, service, cfg;
     bool lightweight = false;
     for( int i = 1; i < argc; ++i )
     {
@@ -316,8 +250,6 @@ int main( int argc, char ** argv )
             mode = a;
         else if( a == "--config" && i + 1 < argc )
             cfg = argv[++i];
-        else if( a == "--extra-dir" && i + 1 < argc )
-            extra_dir = argv[++i];
         else if( a == "--fixtures" && i + 1 < argc )
             g_fixtures = argv[++i];
         else if( a == "--lightweight" )
@@ -326,9 +258,9 @@ int main( int argc, char ** argv )
     if( mode == "--inprocess" )
         return inprocess();
     if( mode == "--agent" && ! cfg.empty() )
-        return agent( service, cfg, extra_dir, lightweight );
+        return agent( service, cfg, lightweight );
     if( mode == "--client" )
         return client( service );
-    fprintf( stderr, "usage: rs-usbd-testd --inprocess | --agent <service> --config <plist> [--extra-dir <dir>] [--lightweight] | --client <service>\n" );
+    fprintf( stderr, "usage: rs-usbd-testd --inprocess | --agent <service> --config <plist> [--lightweight] | --client <service>\n" );
     return 64;
 }

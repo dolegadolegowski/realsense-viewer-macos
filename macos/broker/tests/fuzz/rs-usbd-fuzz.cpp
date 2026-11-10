@@ -8,6 +8,7 @@
 //             parse_enumerate_reply when broker-wire.cpp is available)
 //
 //   rs-usbd-fuzz <target> [--seconds N] [--corpus <dir>] [--seed N] [--fixtures <dir>]
+//                (--fixtures defaults to the tests/fixtures folder next to the sources this binary was built from)
 //   rs-usbd-fuzz <target> --run <file>...      replay inputs
 
 #include "daemon/core/server.h"
@@ -36,6 +37,10 @@
 #include <vector>
 
 using namespace usbd;
+
+#ifndef RSUSBD_FIXTURES
+#define RSUSBD_FIXTURES "tests/fixtures"   // build-daemon.sh passes the absolute path
+#endif
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Coverage
@@ -85,7 +90,7 @@ namespace
         }
     };
 
-    std::string g_fixtures = "macos/broker/tests/fixtures";
+    std::string g_fixtures = RSUSBD_FIXTURES;
 
     // ---------------------------------------------------------------------------------------------------------------
     // session target
@@ -173,8 +178,6 @@ namespace
             mock->set_stream_period( 1, 0x87, 2 );
             pol = new fake_policy;
             config c;
-            c.build_id = std::string( 64, 'a' );
-            c.cdhashes = { std::string( 40, '0' ) };
             timing t;
             t.grace_ms = 50;
             t.watchdog_ms = 2000;

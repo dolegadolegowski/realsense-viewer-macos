@@ -1,7 +1,8 @@
 // License: Apache 2.0. See LICENSE file in root directory.
 // Prints what librealsense's RSUSB layer sees: every usb_enumerator::query_devices_info() entry, then per device the
 // interfaces, endpoints and descriptors of create_usb_device(). Opens nothing, so it runs as any user, through the
-// USB broker when one answers and through in-process libusb otherwise; the two outputs must match (DESIGN.md 9.0.6).
+// RealSense camera service (realsense-usbd) when it answers and through in-process libusb otherwise; the two outputs
+// must match (macos/broker/DESIGN.md 9.0.6).
 // Uses librealsense internals (exported by librealsense2.dylib): build with -I<librealsense>/src and the libusb headers.
 
 #include "usb/usb-enumerator.h"
