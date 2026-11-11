@@ -122,12 +122,16 @@ public enum RealSenseCameraAccess {
         let output = OutputBox()
         let readDone = DispatchSemaphore(value: 0)
         let reader = stdout.fileHandleForReading
-        DispatchQueue.global(qos: .userInitiated).async {
+        // A thread of its own, not a block on a global dispatch queue: macOS starts no such block while as many
+        // threads of the Swift cooperative pool as the Mac has cores are in use, and the probe's line would be lost.
+        let outputReader = Thread {
             while output.count < 4096, let data = try? reader.read(upToCount: 1024), !data.isEmpty {
                 output.append(data)
             }
             readDone.signal()
         }
+        outputReader.name = "RealSenseCameraAccess probe output"
+        outputReader.start()
         if exited.wait(timeout: .now() + timeout) == .timedOut {
             kill(process.processIdentifier, SIGKILL)
             exited.wait()
@@ -400,14 +404,19 @@ public enum RealSenseCameraAccess {
         } catch {
             return .failure(number: -1, message: "/usr/bin/osascript: \(error.localizedDescription)")
         }
-        // Both pipes at once: a full one would block osascript before it exits.
+        // Both pipes at once: a full one would block osascript before it exits. The second reader is a thread of
+        // its own, not a block on a global dispatch queue: macOS starts no such block while as many threads of the
+        // Swift cooperative pool as the Mac has cores are in use (running or blocked), and the wait below would not
+        // end although osascript had exited.
         let errors = OutputBox()
         let errorsDone = DispatchSemaphore(value: 0)
         let errorReader = stderr.fileHandleForReading
-        DispatchQueue.global(qos: .utility).async {
+        let errorThread = Thread {
             errors.append(errorReader.readDataToEndOfFile())
             errorsDone.signal()
         }
+        errorThread.name = "RealSenseCameraAccess osascript stderr"
+        errorThread.start()
         let outputData = stdout.fileHandleForReading.readDataToEndOfFile()
         errorsDone.wait()
         exited.wait()
