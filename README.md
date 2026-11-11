@@ -119,10 +119,15 @@ the 6 visual presets, depth + 2×IR, RGB, accelerometer and gyroscope at 400 Hz,
 the camera the service handed it back to macOS. `rs-macos-selftest --stress` also passed without `sudo` (2026-11-11,
 36 checks): 20 depth start/stop cycles (slowest stop 0.06 s), 30 recording start/stops while depth + RGB stream, the
 presets and options ×3 while streaming, every sensor for 60 s (depth, infrared and RGB at 30.0 fps, IMU throughout,
-memory 302.3 → 302.5 MB) and a hardware reset after which the camera streamed again. Still to be done from
-DESIGN.md 9.2: the one-hour soak test through the service, a standard account, a second user session, the Login
-Items switch, an update over an installed service, a restart of the Mac, MDM camera restrictions, firmware update,
-two cameras. The *Verified* list above was made with the *Run once as administrator* path.
+memory 302.3 → 302.5 MB) and a hardware reset after which the camera streamed again. The installer of this
+repository's package, run as root over the service that IntelFaceScan had installed (the same service version from
+another build), reported that the service was already installed and answering and replaced nothing: the daemon's
+code hash and the dates of the daemon and of its configuration were unchanged. Half an hour of continuous depth and
+color streaming through the service (IntelFaceScan's helper as the user, five runs back to back) ended without an
+error, the daemon at 8.5–9.3 MB and 1–3 % of a core. Still to be done from DESIGN.md 9.2: the one-hour soak test of
+all sensors, a standard account, a second user session, the Login Items switch, an update from an older service, a
+restart of the Mac, MDM camera restrictions, firmware update, two cameras, and the launcher's dialogs for a missing
+service. The *Verified* list above was made with the *Run once as administrator* path.
 
 **Install** (once per Mac, with an administrator's name and password):
 
