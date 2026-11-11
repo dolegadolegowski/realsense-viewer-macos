@@ -116,10 +116,13 @@ same service version, then started without any prompt and opened the camera as t
 `rs-macos-selftest` ran without `sudo`, the self-test passing all 24 checks (enumeration, hardware monitor, options,
 the 6 visual presets, depth + 2×IR, RGB, accelerometer and gyroscope at 400 Hz, all sensors at once, recording to
 `.db3` and playback, repeated start/stop of RGB/IMU while depth streams); five seconds after the last program closed
-the camera the service handed it back to macOS. Still to be done from DESIGN.md 9.2: the `--stress` run and the soak
-test through the service, a standard account, a second user session, the Login Items switch, an update over an
-installed service, a restart of the Mac, MDM camera restrictions, firmware update, two cameras. The *Verified* list
-above was made with the *Run once as administrator* path.
+the camera the service handed it back to macOS. `rs-macos-selftest --stress` also passed without `sudo` (2026-11-11,
+36 checks): 20 depth start/stop cycles (slowest stop 0.06 s), 30 recording start/stops while depth + RGB stream, the
+presets and options ×3 while streaming, every sensor for 60 s (depth, infrared and RGB at 30.0 fps, IMU throughout,
+memory 302.3 → 302.5 MB) and a hardware reset after which the camera streamed again. Still to be done from
+DESIGN.md 9.2: the one-hour soak test through the service, a standard account, a second user session, the Login
+Items switch, an update over an installed service, a restart of the Mac, MDM camera restrictions, firmware update,
+two cameras. The *Verified* list above was made with the *Run once as administrator* path.
 
 **Install** (once per Mac, with an administrator's name and password):
 
