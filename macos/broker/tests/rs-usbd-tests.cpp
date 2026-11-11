@@ -2185,13 +2185,21 @@ namespace
     CASE( h3_golden_recovery ) { h3_golden( "recovery" ); }
     CASE( h3_golden_filtered ) { h3_golden( "filtered" ); }
 
-    // No broker reachable (the real Mach service is not installed here): in-process libusb, decided at once
+    // No broker reachable (the real Mach service is not installed): in-process libusb, decided at once. On a Mac where
+    // the camera service is installed the client reaches the real daemon instead (HELLO only, no device is touched):
+    // there is no fallback to test then, and the case only checks that the decision is kept.
     CASE( h3_fallback_no_broker )
     {
         auto t = clk::now();
         auto b = lp::usb_broker::instance();
         double ms = ms_since( t );
-        CHECK( ! b );
+        if( b )
+        {
+            printf( "the camera service is installed on this Mac: instance() reached it after %.1f ms; the fallback is "
+                    "not tested\n", ms );
+            CHECK( lp::usb_broker::instance() == b );
+            return;
+        }
         CHECK( ms < 1000 );
         auto infos = lp::usb_enumerator::query_devices_info();
         printf( "no broker: instance() nullptr after %.1f ms; in-process libusb lists %zu interfaces\n", ms, infos.size() );
